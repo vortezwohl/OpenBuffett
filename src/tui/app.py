@@ -32,6 +32,8 @@ DEFAULT_SYSTEM_PROMPT = """
 - 工具失败时要直接暴露失败，不要伪装成成功。
 """.strip()
 
+_MIN_TOOL_VISIBLE_MS = 200
+
 
 def build_default_agent(event_sink) -> Agent:
     """构造默认本地主脑控制器。"""
@@ -150,10 +152,19 @@ class AgentWorkbenchApp(App[None]):
     def _apply_loop_event(self, event: LoopEvent) -> None:
         """把一条运行时事件应用到时间线。"""
 
-        self._timeline.apply_event(event)
         channel = event.channel
         event_type = event.event_type
         payload = event.payload
+        if (
+            channel == "progress"
+            and event_type in {"tool_completed", "tool_failed"}
+            and self._should_defer_tool_event(event)
+        ):
+            delay = self._tool_delay_seconds(event)
+            if delay > 0:
+                self.set_timer(delay, lambda: self._apply_tool_terminal_event(event))
+                return
+        self._timeline.apply_event(event)
         if channel == "assistant" and event_type == "assistant_stream_started":
             self._status_message = payload.get("message", "正在生成回复。")
             self._refresh_view()
@@ -180,7 +191,7 @@ class AgentWorkbenchApp(App[None]):
             self._refresh_view()
             return
         if channel == "progress" and event_type in {"tool_started", "tool_completed", "tool_failed"}:
-            self._status_message = str(payload.get("message", self._status_message))
+            self._status_message = self._format_tool_status(event_type, payload)
             self._refresh_view()
 
     def _show_error(self, message: str) -> None:
@@ -243,10 +254,15 @@ class AgentWorkbenchApp(App[None]):
             return f"{item.title}: {item.body}"
         if item.kind == "thinking":
             return f"{item.title}: [{self._thinking_label(item)} {self._format_duration(item.duration_ms)}]"
-        header = f"[{item.title} | {self._format_status_label(item.status)} | {self._format_duration(item.duration_ms)}]"
+        header = (
+            f"[{self._format_tool_label(item)} | "
+            f"{self._format_status_label(item.status)} | "
+            f"{self._format_duration(item.duration_ms)}]"
+        )
         lines = [header]
-        if item.body:
-            lines.append(item.body)
+        error = str(item.metadata.get("error", "")).strip()
+        if error:
+            lines.append(f"错误: {error}")
         if item.preview:
             lines.append(f"概要: {item.preview}")
         if item.detail:
@@ -260,6 +276,49 @@ class AgentWorkbenchApp(App[None]):
         """让输入框在启动后获得焦点。"""
 
         self.query_one("#chat-input", Input).focus()
+
+    def _apply_tool_terminal_event(self, event: LoopEvent) -> None:
+        """在最小可见时长满足后应用工具结束事件。"""
+
+        self._timeline.apply_event(event)
+        self._status_message = self._format_tool_status(
+            event.event_type,
+            event.payload,
+        )
+        self._refresh_view()
+
+    def _should_defer_tool_event(self, event: LoopEvent) -> bool:
+        """判断某条工具结束事件是否需要延后，以保证运行态可见。"""
+
+        return self._tool_delay_seconds(event) > 0
+
+    def _tool_delay_seconds(self, event: LoopEvent) -> float:
+        """计算工具结束事件还需延后的秒数。"""
+
+        tool_name = str(event.payload.get("tool_name", "")).strip()
+        if not tool_name:
+            return 0.0
+        entry = self._find_running_tool_entry(tool_name)
+        if entry is None:
+            return 0.0
+        elapsed_ms = entry.duration_ms
+        if entry.started_at is not None and elapsed_ms <= 0:
+            self._timeline.refresh_running_durations()
+            elapsed_ms = entry.duration_ms
+        remaining_ms = _MIN_TOOL_VISIBLE_MS - elapsed_ms
+        if remaining_ms <= 0:
+            return 0.0
+        return remaining_ms / 1000
+
+    def _find_running_tool_entry(self, tool_name: str) -> TimelineEntry | None:
+        """按原始工具名查找仍在运行中的工具条目。"""
+
+        for item in self._timeline.entries:
+            if item.kind != "tool" or item.status != "running":
+                continue
+            if str(item.metadata.get("tool_name", "")) == tool_name:
+                return item
+        return None
 
     @staticmethod
     def _format_status_label(status: str) -> str:
@@ -286,6 +345,27 @@ class AgentWorkbenchApp(App[None]):
         cycle = (item.duration_ms // 350) % 3
         suffix = (".", "..", "...")[cycle]
         return f"{item.body} {suffix}"
+
+    @staticmethod
+    def _format_tool_label(item: TimelineEntry) -> str:
+        """基于原始语义字段渲染工具条目标识。"""
+
+        tool_name = str(item.metadata.get("tool_name", "tool")).strip() or "tool"
+        tool_kind = str(item.metadata.get("tool_kind", "")).strip()
+        if not tool_kind:
+            return tool_name
+        return f"{tool_name} [{tool_kind}]"
+
+    @staticmethod
+    def _format_tool_status(event_type: str, payload: dict[str, Any]) -> str:
+        """基于原始语义字段生成顶部状态文案。"""
+
+        tool_name = str(payload.get("tool_name", "tool")).strip() or "tool"
+        if event_type == "tool_started":
+            return f"调用工具: {tool_name}"
+        if event_type == "tool_failed":
+            return f"工具失败: {tool_name}"
+        return f"工具完成: {tool_name}"
 
     @staticmethod
     def _should_follow_scroll(scroll_widget: VerticalScroll) -> bool:

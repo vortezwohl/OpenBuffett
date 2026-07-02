@@ -28,9 +28,7 @@ class ConversationTimelineTests(unittest.TestCase):
                 "progress",
                 "tool_started",
                 tool_name="text.read",
-                display_name="Text read",
                 tool_kind="fileglide",
-                message="开始调用 Text read。",
             )
         )
         timeline.apply_event(
@@ -38,10 +36,8 @@ class ConversationTimelineTests(unittest.TestCase):
                 "progress",
                 "tool_completed",
                 tool_name="text.read",
-                display_name="Text read",
                 tool_kind="fileglide",
                 duration_ms=12,
-                message="Text read 调用完成。",
                 result_preview="README.md",
                 result_detail="README.md\nline 2\nline 3",
                 collapsible=True,
@@ -62,12 +58,46 @@ class ConversationTimelineTests(unittest.TestCase):
         self.assertEqual(len(entries), 3)
         self.assertEqual(entries[0].kind, "user")
         self.assertEqual(entries[1].kind, "tool")
+        self.assertEqual(entries[1].metadata["tool_name"], "text.read")
+        self.assertEqual(entries[1].metadata["tool_kind"], "fileglide")
+        self.assertEqual(entries[1].title, "")
+        self.assertEqual(entries[1].body, "")
         self.assertEqual(entries[1].preview, "README.md")
         self.assertEqual(entries[1].detail, "README.md\nline 2\nline 3")
         self.assertTrue(entries[1].collapsible)
         self.assertTrue(entries[1].collapsed)
         self.assertEqual(entries[2].kind, "assistant")
         self.assertEqual(entries[2].body, "已完成")
+
+    def test_tool_failure_keeps_raw_error_in_metadata(self) -> None:
+        """工具失败时应把原始错误信息保留在 metadata。"""
+
+        timeline = ConversationTimeline()
+        timeline.apply_event(
+            build_loop_event(
+                "progress",
+                "tool_started",
+                tool_name="text.write",
+                tool_kind="fileglide",
+            )
+        )
+        timeline.apply_event(
+            build_loop_event(
+                "progress",
+                "tool_failed",
+                tool_name="text.write",
+                tool_kind="fileglide",
+                duration_ms=34,
+                error="disk full",
+            )
+        )
+
+        entry = timeline.entries[0]
+        self.assertEqual(entry.status, "error")
+        self.assertEqual(entry.metadata["tool_name"], "text.write")
+        self.assertEqual(entry.metadata["tool_kind"], "fileglide")
+        self.assertEqual(entry.metadata["error"], "disk full")
+        self.assertEqual(entry.body, "")
 
     def test_refresh_running_durations_updates_active_entries(self) -> None:
         """运行中条目应能按当前时间刷新时长。"""

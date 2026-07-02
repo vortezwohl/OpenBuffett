@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 from textual.widgets import Input
 
@@ -15,8 +16,8 @@ from src.core.strands_runtime import StrandsRunResult
 from src.tui.app import AgentWorkbenchApp
 
 
-class _FakeUiSessionLoop:
-    """用于驱动 TUI 冒烟测试的假 Agent。"""
+class _BaseUiSessionLoop:
+    """用于驱动 TUI 测试的假 Agent 基类。"""
 
     def __init__(self) -> None:
         self.event_sink = None
@@ -28,6 +29,57 @@ class _FakeUiSessionLoop:
 
     def reset(self) -> None:
         self._history = []
+
+    def _emit_tool_completed(self) -> None:
+        """发送工具完成事件。"""
+
+        if self.event_sink is None:
+            return
+        self.event_sink(
+            build_loop_event(
+                "progress",
+                "tool_completed",
+                tool_name="text.read",
+                tool_kind="fileglide",
+                duration_ms=12,
+                result_preview="README.md",
+                result_detail="README.md\nline 2\nline 3",
+                collapsible=True,
+                collapsed_by_default=True,
+            )
+        )
+
+    def _emit_assistant_completed(self) -> None:
+        """发送 assistant 完成事件。"""
+
+        if self.event_sink is None:
+            return
+        self.event_sink(
+            build_loop_event(
+                "assistant",
+                "assistant_stream_started",
+                message="正在生成回复。",
+            )
+        )
+        self.event_sink(
+            build_loop_event(
+                "assistant",
+                "assistant_stream_delta",
+                text="已完成",
+            )
+        )
+        self.event_sink(
+            build_loop_event(
+                "assistant",
+                "assistant_stream_completed",
+                text="已完成",
+                fallback=False,
+            )
+        )
+
+
+class _FakeUiSessionLoop(_BaseUiSessionLoop):
+    """用于驱动 TUI 冒烟测试的假 Agent。"""
 
     def run(self, prompt: str) -> StrandsRunResult:
         self._history.append(SessionTurn(role="user", content=prompt))
@@ -44,48 +96,50 @@ class _FakeUiSessionLoop:
                     "progress",
                     "tool_started",
                     tool_name="text.read",
-                    display_name="Text read",
                     tool_kind="fileglide",
-                    message="开始调用 Text read。",
                 )
             )
+            self._emit_tool_completed()
+            self._emit_assistant_completed()
+        self._history.append(SessionTurn(role="assistant", content="已完成"))
+        return StrandsRunResult(text="已完成")
+
+
+class _SlowToolSessionLoop(_BaseUiSessionLoop):
+    """用于验证运行中工具条目和计时可见性的假 Agent。"""
+
+    def run(self, prompt: str) -> StrandsRunResult:
+        self._history.append(SessionTurn(role="user", content=prompt))
+        if self.event_sink is not None:
             self.event_sink(
                 build_loop_event(
                     "progress",
-                    "tool_completed",
+                    "tool_started",
                     tool_name="text.read",
-                    display_name="Text read",
                     tool_kind="fileglide",
-                    duration_ms=12,
-                    message="Text read 调用完成。",
-                    result_preview="README.md",
-                    result_detail="README.md\nline 2\nline 3",
-                    collapsible=True,
-                    collapsed_by_default=True,
                 )
             )
+            time.sleep(0.35)
+            self._emit_tool_completed()
+        self._history.append(SessionTurn(role="assistant", content="已完成"))
+        return StrandsRunResult(text="已完成")
+
+
+class _FastToolSessionLoop(_BaseUiSessionLoop):
+    """用于验证快速工具也会先显示运行态的假 Agent。"""
+
+    def run(self, prompt: str) -> StrandsRunResult:
+        self._history.append(SessionTurn(role="user", content=prompt))
+        if self.event_sink is not None:
             self.event_sink(
                 build_loop_event(
-                    "assistant",
-                    "assistant_stream_started",
-                    message="正在生成回复。",
+                    "progress",
+                    "tool_started",
+                    tool_name="text.read",
+                    tool_kind="fileglide",
                 )
             )
-            self.event_sink(
-                build_loop_event(
-                    "assistant",
-                    "assistant_stream_delta",
-                    text="已完成",
-                )
-            )
-            self.event_sink(
-                build_loop_event(
-                    "assistant",
-                    "assistant_stream_completed",
-                    text="已完成",
-                    fallback=False,
-                )
-            )
+            self._emit_tool_completed()
         self._history.append(SessionTurn(role="assistant", content="已完成"))
         return StrandsRunResult(text="已完成")
 
@@ -109,12 +163,11 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 {"input": input_widget, "value": "整理 README"},
             )()
             app.on_input_submitted(fake_event)
-            await pilot.pause()
-            await pilot.pause()
+            await pilot.pause(0.35)
             text = app._render_timeline_text()
 
         self.assertIn("你: 整理 README", text)
-        self.assertIn("文件工具 · Text read", text)
+        self.assertIn("text.read [fileglide]", text)
         self.assertIn("概要: README.md", text)
         self.assertIn("结果: [详细结果已收起]", text)
         self.assertIn("AI: 已完成", text)
@@ -137,6 +190,59 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         text = app._render_timeline_text()
 
         self.assertIn("thinking ...", text)
+
+    async def test_running_tool_entry_and_timer_are_visible_before_completion(self) -> None:
+        """工具运行中时，时间线里应先看到运行态和计时。"""
+
+        session_loop = _SlowToolSessionLoop()
+        app = AgentWorkbenchApp(session_loop=session_loop)
+        session_loop.event_sink = app._dispatch_runtime_event
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            input_widget.value = "整理 README"
+            fake_event = type(
+                "FakeSubmittedEvent",
+                (),
+                {"input": input_widget, "value": "整理 README"},
+            )()
+            app.on_input_submitted(fake_event)
+            await pilot.pause(0.15)
+            mid_text = app._render_timeline_text()
+            await pilot.pause(0.35)
+            final_text = app._render_timeline_text()
+
+        self.assertIn("text.read [fileglide]", mid_text)
+        self.assertIn("进行中", mid_text)
+        self.assertRegex(mid_text, r"0\.\d{2}s")
+        self.assertIn("完成", final_text)
+        self.assertIn("概要: README.md", final_text)
+
+    async def test_fast_tool_stays_running_for_one_visible_frame(self) -> None:
+        """极快完成的工具也应先显示一次运行态，再切到完成态。"""
+
+        session_loop = _FastToolSessionLoop()
+        app = AgentWorkbenchApp(session_loop=session_loop)
+        session_loop.event_sink = app._dispatch_runtime_event
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            input_widget.value = "整理 README"
+            fake_event = type(
+                "FakeSubmittedEvent",
+                (),
+                {"input": input_widget, "value": "整理 README"},
+            )()
+            app.on_input_submitted(fake_event)
+            await pilot.pause(0.05)
+            running_text = app._render_timeline_text()
+            await pilot.pause(0.30)
+            done_text = app._render_timeline_text()
+
+        self.assertIn("text.read [fileglide]", running_text)
+        self.assertIn("进行中", running_text)
+        self.assertIn("完成", done_text)
+        self.assertIn("概要: README.md", done_text)
 
 
 if __name__ == "__main__":

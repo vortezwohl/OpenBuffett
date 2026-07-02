@@ -13,12 +13,6 @@ from typing import Any
 from src.core.events import LoopEvent
 
 
-TOOL_KIND_LABELS = {
-    "native": "工具",
-    "fileglide": "文件工具",
-}
-
-
 @dataclass(slots=True)
 class TimelineEntry:
     """描述一条跨 UI 复用的时间线条目。"""
@@ -179,17 +173,20 @@ class ConversationTimeline:
         created_at: datetime,
     ) -> None:
         tool_name = str(payload.get("tool_name", "tool"))
-        title = self._format_tool_title(payload)
+        tool_kind = str(payload.get("tool_kind", "")).strip()
         item = self._get_entry(self._running_tool_keys.get(tool_name, ""))
         if event_type == "tool_started":
             self._remove_thinking()
             key = self._append_entry(
                 kind="tool",
-                title=title,
-                body=str(payload.get("message", "")).strip(),
+                title="",
+                body="",
                 status="running",
                 started_at=created_at,
-                metadata={"tool_name": tool_name},
+                metadata={
+                    "tool_name": tool_name,
+                    "tool_kind": tool_kind,
+                },
             )
             self._running_tool_keys[tool_name] = key
             return
@@ -197,23 +194,28 @@ class ConversationTimeline:
         detail = str(payload.get("result_detail", "")).strip()
         collapsible = bool(payload.get("collapsible", False))
         collapsed = bool(payload.get("collapsed_by_default", False))
+        error = str(payload.get("error", "")).strip()
+        metadata = {
+            "tool_name": tool_name,
+            "tool_kind": tool_kind,
+        }
+        if error:
+            metadata["error"] = error
         if item is None:
             self._append_entry(
                 kind="tool",
-                title=title,
-                body=str(payload.get("message", "")).strip(),
+                title="",
+                body="",
                 preview=preview,
                 detail=detail,
                 collapsible=collapsible,
                 collapsed=collapsed,
                 status="done" if event_type == "tool_completed" else "error",
                 duration_ms=int(payload.get("duration_ms", 0) or 0),
-                metadata={"tool_name": tool_name},
+                metadata=metadata,
             )
             self._running_tool_keys.pop(tool_name, None)
             return
-        item.title = title
-        item.body = str(payload.get("message", "")).strip() or item.body
         item.preview = preview or item.preview
         item.detail = detail or item.detail
         item.collapsible = collapsible
@@ -224,6 +226,7 @@ class ConversationTimeline:
             or item.duration_ms
         )
         item.started_at = None
+        item.metadata.update(metadata)
         self._running_tool_keys.pop(tool_name, None)
 
     def _append_entry(
@@ -269,9 +272,3 @@ class ConversationTimeline:
     def _next_key(self, prefix: str) -> str:
         self._item_counter += 1
         return f"{prefix}-{self._item_counter}"
-
-    @staticmethod
-    def _format_tool_title(payload: dict[str, Any]) -> str:
-        kind = TOOL_KIND_LABELS.get(str(payload.get("tool_kind", "")), "工具")
-        display_name = str(payload.get("display_name", "Tool"))
-        return f"{kind} · {display_name}"

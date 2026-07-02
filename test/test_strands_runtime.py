@@ -308,6 +308,40 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(events[0].payload["tool_name"], "text.write")
         self.assertEqual(events[1].payload["tool_name"], "text.write")
+        self.assertNotIn("display_name", events[0].payload)
+        self.assertNotIn("message", events[0].payload)
+        self.assertNotIn("display_name", events[1].payload)
+        self.assertNotIn("message", events[1].payload)
+        self.assertNotIn("result_summary", events[1].payload)
+
+    def test_tool_failure_event_keeps_raw_error_without_ui_message(self) -> None:
+        """工具失败事件应保留原始错误文本，而不是 UI 展示文案。"""
+
+        events: list[LoopEvent] = []
+
+        def _handler(_context: ToolContext, **_kwargs) -> ToolResult:
+            raise RuntimeError("disk full")
+
+        wrapped = build_strands_tool(
+            tool_spec=ToolSpec(
+                name="text.write",
+                description="write text",
+                display_name="Text write",
+                input_schema={"type": "object", "properties": {}},
+                handler=_handler,
+                tool_kind="fileglide",
+            ),
+            event_sink=events.append,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "disk full"):
+            wrapped(target="note.txt", content="hello")
+
+        self.assertEqual(events[-1].event_type, "tool_failed")
+        self.assertEqual(events[-1].payload["tool_name"], "text.write")
+        self.assertEqual(events[-1].payload["error"], "disk full")
+        self.assertNotIn("display_name", events[-1].payload)
+        self.assertNotIn("message", events[-1].payload)
 
     def test_provider_tool_name_collision_fails_fast(self) -> None:
         """不同内部工具名若映射到同一 provider 名，应立即失败。"""

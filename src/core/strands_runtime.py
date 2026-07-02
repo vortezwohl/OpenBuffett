@@ -338,9 +338,7 @@ def build_strands_tool(
                     "progress",
                     "tool_started",
                     tool_name=tool_spec.name,
-                    display_name=tool_spec.display_name,
                     tool_kind=tool_spec.tool_kind,
-                    message=f"开始调用 {tool_spec.display_name}。",
                 )
             )
         context = build_tool_context(
@@ -359,10 +357,9 @@ def build_strands_tool(
                         "progress",
                         "tool_failed",
                         tool_name=tool_spec.name,
-                        display_name=tool_spec.display_name,
                         tool_kind=tool_spec.tool_kind,
                         duration_ms=duration_ms,
-                        message=f"{tool_spec.display_name} 调用失败: {error}",
+                        error=str(error),
                     )
                 )
             raise
@@ -383,15 +380,12 @@ def build_strands_tool(
                     "progress",
                     "tool_completed",
                     tool_name=tool_spec.name,
-                    display_name=tool_spec.display_name,
                     tool_kind=tool_spec.tool_kind,
                     duration_ms=duration_ms,
-                    result_summary=result.summary,
                     result_preview=result_payload["result_preview"],
                     result_detail=result_payload["result_detail"],
                     collapsible=result_payload["collapsible"],
                     collapsed_by_default=result_payload["collapsed_by_default"],
-                    message=f"{tool_spec.display_name} 调用完成。",
                 )
             )
         return _serialize_tool_result(result)
