@@ -1,0 +1,18 @@
+[project]
+name = "smartipo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ifindapi>=0.0.8",
+    "litellm>=1.90.2",
+    "markitdown>=0.1.6",
+    "opentrade>=1.2.0",
+    "prompt4py>=0.0.6",
+    "requests>=2.34.2",
+    "sqlalchemy>=2.0.51",
+    "textual>=8.2.8",
+    "textual-dev>=1.8.0",
+    "vortezwohl>=0.1.3",
+]
