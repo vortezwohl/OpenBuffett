@@ -150,6 +150,39 @@ class ConversationTimelineTests(unittest.TestCase):
             "provider-side tool call did not reach local execution",
         )
 
+    def test_tool_terminal_event_keeps_visible_duration_and_stores_execution_duration(self) -> None:
+        """工具结束时应保留已展示时长，并单独记录真实执行时长。"""
+
+        timeline = ConversationTimeline()
+        timeline.apply_event(
+            build_loop_event(
+                "progress",
+                "tool_started",
+                tool_name="path.list",
+                tool_kind="fileglide",
+                tool_use_id="tool-4",
+            )
+        )
+        entry = timeline.entries[0]
+        entry.visible_duration_ms = 240
+        timeline.apply_event(
+            build_loop_event(
+                "progress",
+                "tool_completed",
+                tool_name="path.list",
+                tool_kind="fileglide",
+                tool_use_id="tool-4",
+                duration_ms=3,
+                result_preview="path.list",
+                result_detail="path.list",
+            )
+        )
+
+        entry = timeline.entries[0]
+        self.assertEqual(entry.status, "done")
+        self.assertEqual(entry.visible_duration_ms, 240)
+        self.assertEqual(entry.execution_duration_ms, 3)
+
     def test_refresh_running_durations_updates_active_entries(self) -> None:
         """运行中条目应能按当前时间刷新时长。"""
 
@@ -161,7 +194,7 @@ class ConversationTimelineTests(unittest.TestCase):
         changed = timeline.refresh_running_durations(datetime.now())
 
         self.assertTrue(changed)
-        self.assertGreaterEqual(timeline.entries[0].duration_ms, 900)
+        self.assertGreaterEqual(timeline.entries[0].visible_duration_ms, 900)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,8 @@ DEFAULT_SYSTEM_PROMPT = """
 """.strip()
 
 _MIN_TOOL_VISIBLE_MS = 200
+_TIMELINE_REFRESH_INTERVAL_SECONDS = 0.01
+_THINKING_ANIMATION_FRAME_MS = 150
 DEFAULT_WORKBENCH_TOOL_NAMES = (
     "path.list",
     "file.list",
@@ -120,7 +122,10 @@ class AgentWorkbenchApp(App[None]):
         """挂载后刷新界面并开始计时。"""
 
         self._refresh_view()
-        self.set_interval(0.1, self._refresh_running_timeline)
+        self.set_interval(
+            _TIMELINE_REFRESH_INTERVAL_SECONDS,
+            self._refresh_running_timeline,
+        )
         self.call_after_refresh(self._focus_chat_input)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -260,11 +265,14 @@ class AgentWorkbenchApp(App[None]):
         if item.kind in {"user", "assistant", "system"}:
             return f"{item.title}: {item.body}"
         if item.kind == "thinking":
-            return f"{item.title}: [{self._thinking_label(item)} {self._format_duration(item.duration_ms)}]"
+            return (
+                f"{self._format_duration(item.visible_duration_ms)} | "
+                f"{item.title}: {self._thinking_label(item)}"
+            )
         header = (
-            f"[{self._format_tool_label(item)} | "
-            f"{self._format_status_label(item.status)} | "
-            f"{self._format_duration(item.duration_ms)}]"
+            f"{self._format_duration(item.visible_duration_ms)} | "
+            f"{self._format_tool_label(item)} | "
+            f"{self._format_status_label(item.status)}"
         )
         lines = [header]
         phase = self._format_tool_phase(item)
@@ -311,10 +319,10 @@ class AgentWorkbenchApp(App[None]):
         entry = self._find_running_tool_entry(tool_name)
         if entry is None:
             return 0.0
-        elapsed_ms = entry.duration_ms
+        elapsed_ms = entry.visible_duration_ms
         if entry.started_at is not None and elapsed_ms <= 0:
             self._timeline.refresh_running_durations()
-            elapsed_ms = entry.duration_ms
+            elapsed_ms = entry.visible_duration_ms
         remaining_ms = _MIN_TOOL_VISIBLE_MS - elapsed_ms
         if remaining_ms <= 0:
             return 0.0
@@ -352,7 +360,7 @@ class AgentWorkbenchApp(App[None]):
 
         if item.status != "running":
             return item.body
-        cycle = (item.duration_ms // 350) % 3
+        cycle = (item.visible_duration_ms // _THINKING_ANIMATION_FRAME_MS) % 3
         suffix = (".", "..", "...")[cycle]
         return f"{item.body} {suffix}"
 

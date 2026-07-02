@@ -246,11 +246,11 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         thinking_entry = app._timeline.entries[-1]
-        thinking_entry.duration_ms = 800
+        thinking_entry.visible_duration_ms = 800
 
         text = app._render_timeline_text()
 
-        self.assertIn("thinking ...", text)
+        self.assertIn("0.80s | AI: thinking ...", text)
 
     def test_default_workbench_tool_set_is_minimal_and_read_only(self) -> None:
         """默认 workbench 只暴露最小高频只读工具集合。"""
@@ -283,7 +283,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("text.read [fileglide]", mid_text)
         self.assertIn("进行中", mid_text)
-        self.assertRegex(mid_text, r"0\.\d{2}s")
+        self.assertRegex(mid_text, r"0\.\d{2}s \| text\.read \[fileglide\] \| 进行中")
         self.assertIn("完成", final_text)
         self.assertIn("概要: README.md", final_text)
 
@@ -311,6 +311,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("text.read [fileglide]", running_text)
         self.assertIn("进行中", running_text)
         self.assertIn("完成", done_text)
+        self.assertNotIn("0.00s | text.read [fileglide] | 完成", done_text)
         self.assertIn("概要: README.md", done_text)
 
     async def test_provider_side_tool_attempt_failure_is_visible(self) -> None:

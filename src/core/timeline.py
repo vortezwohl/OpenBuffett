@@ -24,7 +24,8 @@ class TimelineEntry:
     preview: str = ""
     detail: str = ""
     status: str = "done"
-    duration_ms: int = 0
+    visible_duration_ms: int = 0
+    execution_duration_ms: int = 0
     started_at: datetime | None = None
     collapsible: bool = False
     collapsed: bool = False
@@ -106,8 +107,8 @@ class ConversationTimeline:
                 0,
                 int((current_time - item.started_at).total_seconds() * 1000),
             )
-            if new_duration != item.duration_ms:
-                item.duration_ms = new_duration
+            if new_duration != item.visible_duration_ms:
+                item.visible_duration_ms = new_duration
                 changed = True
         return changed
 
@@ -211,7 +212,7 @@ class ConversationTimeline:
                 self._running_tool_keys[tool_use_id] = key
                 return
             item.started_at = created_at
-            item.duration_ms = 0
+            item.visible_duration_ms = 0
             item.status = "running"
             item.metadata.update(
                 {
@@ -228,6 +229,7 @@ class ConversationTimeline:
         collapsed = bool(payload.get("collapsed_by_default", False))
         error = str(payload.get("error", "")).strip()
         failure_stage = str(payload.get("failure_stage", "")).strip()
+        execution_duration_ms = int(payload.get("duration_ms", 0) or 0)
         metadata = {
             "tool_name": tool_name,
             "tool_kind": tool_kind,
@@ -251,7 +253,8 @@ class ConversationTimeline:
                 collapsible=collapsible,
                 collapsed=collapsed,
                 status="done" if event_type == "tool_completed" else "error",
-                duration_ms=int(payload.get("duration_ms", 0) or 0),
+                visible_duration_ms=execution_duration_ms,
+                execution_duration_ms=execution_duration_ms,
                 metadata=metadata,
             )
             self._running_tool_keys.pop(tool_use_id, None)
@@ -261,10 +264,8 @@ class ConversationTimeline:
         item.collapsible = collapsible
         item.collapsed = collapsed if collapsible else False
         item.status = "done" if event_type == "tool_completed" else "error"
-        item.duration_ms = int(
-            payload.get("duration_ms", 0)
-            or item.duration_ms
-        )
+        item.visible_duration_ms = max(item.visible_duration_ms, execution_duration_ms)
+        item.execution_duration_ms = execution_duration_ms
         item.started_at = None
         item.metadata.update(metadata)
         self._running_tool_keys.pop(tool_use_id, None)
@@ -278,7 +279,8 @@ class ConversationTimeline:
         preview: str = "",
         detail: str = "",
         status: str = "done",
-        duration_ms: int = 0,
+        visible_duration_ms: int = 0,
+        execution_duration_ms: int = 0,
         started_at: datetime | None = None,
         collapsible: bool = False,
         collapsed: bool = False,
@@ -294,7 +296,8 @@ class ConversationTimeline:
                 preview=preview,
                 detail=detail,
                 status=status,
-                duration_ms=duration_ms,
+                visible_duration_ms=visible_duration_ms,
+                execution_duration_ms=execution_duration_ms,
                 started_at=started_at,
                 collapsible=collapsible,
                 collapsed=collapsed,
