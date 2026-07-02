@@ -432,8 +432,9 @@ def _invoke_agent(
 def _serialize_tool_result(result: ToolResult) -> str:
     """把工具结果整理为主脑可读文本。"""
 
-    if result.summary:
-        return result.summary
+    model_text = str(result.metadata.get("model_text", "")).strip()
+    if model_text:
+        return model_text
     if isinstance(result.content, str):
         return result.content
     return json.dumps(result.content, ensure_ascii=False, default=str)
@@ -463,6 +464,31 @@ def _truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit].rstrip()}..."
+
+
+def _build_tool_model_error(error: Exception) -> str:
+    """提取应回给模型的错误文本。"""
+
+    message = str(error).strip()
+    if message:
+        return message
+    return error.__class__.__name__
+
+
+def _build_tool_event_error_payload(error: Exception) -> dict[str, str]:
+    """提取应回给时间线的原始错误诊断。"""
+
+    raw_error = str(getattr(error, "raw_error", "")).strip()
+    if not raw_error:
+        raw_error = _build_tool_model_error(error)
+    payload = {"error": raw_error}
+    error_code = str(getattr(error, "error_code", "")).strip()
+    if error_code:
+        payload["error_code"] = error_code
+    model_error = _build_tool_model_error(error)
+    if model_error != raw_error:
+        payload["model_error"] = model_error
+    return payload
 
 
 class _ProjectStrandsTool(PythonAgentTool):
@@ -535,7 +561,10 @@ class _ProjectStrandsTool(PythonAgentTool):
         try:
             result = self._invoke_project_tool(tool_input, tool_use_id=tool_use_id)
         except Exception as error:
-            return _build_strands_error_result(tool_use_id, str(error))
+            return _build_strands_error_result(
+                tool_use_id,
+                _build_tool_model_error(error),
+            )
         return _build_strands_success_result(
             tool_use_id,
             _serialize_tool_result(result),
@@ -566,6 +595,7 @@ class _ProjectStrandsTool(PythonAgentTool):
         except Exception as error:
             duration_ms = int((time.perf_counter() - start_time) * 1000)
             if self._event_sink is not None:
+                error_payload = _build_tool_event_error_payload(error)
                 self._event_sink(
                     build_loop_event(
                         "progress",
@@ -574,8 +604,8 @@ class _ProjectStrandsTool(PythonAgentTool):
                         tool_kind=self._project_tool_spec.tool_kind,
                         tool_use_id=tool_use_id,
                         duration_ms=duration_ms,
-                        error=str(error),
                         failure_stage="execution",
+                        **error_payload,
                     )
                 )
             raise

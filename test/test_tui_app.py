@@ -13,7 +13,11 @@ from textual.widgets import Input
 from src.core.agent import SessionTurn
 from src.core.events import build_loop_event
 from src.core.strands_runtime import StrandsRunResult
-from src.tui.app import AgentWorkbenchApp, DEFAULT_WORKBENCH_TOOL_NAMES
+from src.tui.app import (
+    AgentWorkbenchApp,
+    DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_WORKBENCH_TOOL_NAMES,
+)
 
 
 class _BaseUiSessionLoop:
@@ -259,6 +263,13 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             DEFAULT_WORKBENCH_TOOL_NAMES,
             ("path.list", "file.list", "text.read", "text.grep"),
         )
+
+    def test_default_system_prompt_keeps_tool_rules_out_of_prompt(self) -> None:
+        """默认提示词应只保留调度职责，不承担工具手册责任。"""
+
+        self.assertIn("先做范围尽可能小的只读探索，再进入修改", DEFAULT_SYSTEM_PROMPT)
+        self.assertNotIn("root", DEFAULT_SYSTEM_PROMPT)
+        self.assertNotIn("recursive=false", DEFAULT_SYSTEM_PROMPT)
 
     async def test_running_tool_entry_and_timer_are_visible_before_completion(self) -> None:
         """工具运行中时，时间线里应先看到运行态和计时。"""

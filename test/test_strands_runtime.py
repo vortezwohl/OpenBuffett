@@ -24,6 +24,7 @@ from src.core.strands_runtime import (
 from src.model_config import AGENT_SESSION_ROUND, BRAIN_MODEL_CONFIGS, CHANNEL_CONFIGS
 from src.service.model_hub import create_default_brain_model, validate_model_config
 from src.tool.contracts import ToolContext, ToolResult, ToolSpec
+from src.tool.fileglide_tools import build_fileglide_tool_specs
 from src.tool.registry import ToolRegistry, build_default_tool_registry
 
 
@@ -292,6 +293,18 @@ class SessionRuntimeTests(unittest.TestCase):
             self.assertTrue(note_path.exists())
             self.assertEqual(note_path.read_text(encoding="utf-8"), "hello from fileglide")
 
+    def test_all_fileglide_tool_descriptions_are_detailed_and_english(self) -> None:
+        """fileglide tools 应提供结构化英文 description。"""
+
+        for spec in build_fileglide_tool_specs():
+            description = spec.description
+            self.assertIn("Purpose:", description, spec.name)
+            self.assertIn("When to use:", description, spec.name)
+            self.assertIn("Parameters:", description, spec.name)
+            self.assertIn("Returns:", description, spec.name)
+            self.assertIn("Common failures:", description, spec.name)
+            self.assertNotRegex(description, r"[\u4e00-\u9fff]", spec.name)
+
     def test_schema_driven_tools_consume_provider_tool_input_directly(self) -> None:
         """schema-driven 工具应直接消费 provider tool input 并进入本地 handler。"""
 
@@ -338,8 +351,120 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(path_events[-1]["tool_result"]["status"], "success")
         self.assertEqual(text_events[-1]["tool_result"]["status"], "success")
         self.assertEqual(path_events[-1]["tool_result"]["toolUseId"], "tool-1")
-        self.assertTrue(path_events[-1]["tool_result"]["content"][0]["text"])
-        self.assertEqual(text_events[-1]["tool_result"]["content"][0]["text"], "docs/note.txt")
+        self.assertIn(
+            "Entry count: 2",
+            path_events[-1]["tool_result"]["content"][0]["text"],
+        )
+        self.assertIn(
+            "- docs [directory]",
+            path_events[-1]["tool_result"]["content"][0]["text"],
+        )
+        self.assertIn(
+            "File: docs/note.txt",
+            text_events[-1]["tool_result"]["content"][0]["text"],
+        )
+        self.assertIn(
+            "1: hello",
+            text_events[-1]["tool_result"]["content"][0]["text"],
+        )
+
+    def test_readonly_tools_normalize_absolute_paths_and_reject_conflicting_root(self) -> None:
+        """只读 fileglide 工具应规范化绝对路径，并显式拒绝冲突 root。"""
+
+        async def _collect_events(tool, tool_use: dict[str, object]) -> list[dict[str, object]]:
+            items: list[dict[str, object]] = []
+            async for event in tool.stream(tool_use, {}):
+                items.append(dict(event))
+            return items
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "docs").mkdir()
+            (root / "docs" / "note.txt").write_text("hello", encoding="utf-8")
+
+            registry = build_default_tool_registry()
+            path_list_tool = build_strands_tool(
+                tool_spec=registry.get("path.list"),
+                workspace_root=temp_dir,
+            )
+            text_read_tool = build_strands_tool(
+                tool_spec=registry.get("text.read"),
+                workspace_root=temp_dir,
+            )
+
+            path_events = asyncio.run(
+                _collect_events(
+                    path_list_tool,
+                    {
+                        "toolUseId": "tool-1",
+                        "input": {"start": str(root / "docs")},
+                    },
+                )
+            )
+            text_events = asyncio.run(
+                _collect_events(
+                    text_read_tool,
+                    {
+                        "toolUseId": "tool-2",
+                        "input": {"target": str(root / "docs" / "note.txt")},
+                    },
+                )
+            )
+            conflict_events = asyncio.run(
+                _collect_events(
+                    text_read_tool,
+                    {
+                        "toolUseId": "tool-3",
+                        "input": {
+                            "root": temp_dir,
+                            "target": r"D:\other\note.txt",
+                        },
+                    },
+                )
+            )
+
+        self.assertEqual(path_events[-1]["tool_result"]["status"], "success")
+        self.assertIn(
+            "Start: Users/",
+            path_events[-1]["tool_result"]["content"][0]["text"],
+        )
+        self.assertEqual(text_events[-1]["tool_result"]["status"], "success")
+        self.assertIn(
+            "File: Users/",
+            text_events[-1]["tool_result"]["content"][0]["text"],
+        )
+        self.assertEqual(conflict_events[-1]["tool_result"]["status"], "error")
+        self.assertIn(
+            "violates the root-relative path contract",
+            conflict_events[-1]["tool_result"]["content"][0]["text"],
+        )
+        self.assertIn(
+            "root=",
+            conflict_events[-1]["tool_result"]["content"][0]["text"],
+        )
+
+    def test_list_tools_default_to_non_recursive_exploration(self) -> None:
+        """列举类工具默认应先停留在当前层。"""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "docs" / "nested").mkdir(parents=True)
+            (root / "docs" / "nested" / "deep.txt").write_text(
+                "deep",
+                encoding="utf-8",
+            )
+
+            wrapped = build_strands_tool(
+                tool_spec=build_default_tool_registry().get("path.list"),
+                workspace_root=temp_dir,
+            )
+
+            result = wrapped(start="docs")
+
+        self.assertIn("Entry count: 2", result)
+        self.assertIn("- docs [directory]", result)
+        self.assertIn("- docs/nested [directory]", result)
+        self.assertNotIn("deep.txt", result)
 
     def test_provider_tool_name_is_sanitized_but_events_keep_internal_name(self) -> None:
         """provider-facing 工具名应合法化，但事件仍保留内部工具名。"""
@@ -347,7 +472,8 @@ class SessionRuntimeTests(unittest.TestCase):
         events: list[LoopEvent] = []
 
         def _handler(_context: ToolContext, **kwargs) -> ToolResult:
-            return ToolResult(content=kwargs, summary="ok")
+            _ = kwargs
+            return ToolResult(content="ok", summary="ok")
 
         wrapped = build_strands_tool(
             tool_spec=ToolSpec(
@@ -402,6 +528,24 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(events[-1].payload["error"], "disk full")
         self.assertNotIn("display_name", events[-1].payload)
         self.assertNotIn("message", events[-1].payload)
+
+    def test_tool_failure_returns_model_friendly_error_but_event_keeps_raw_error(self) -> None:
+        """模型侧错误正文应可纠错，时间线事件仍保留原始诊断。"""
+
+        events: list[LoopEvent] = []
+        wrapped = build_strands_tool(
+            tool_spec=build_default_tool_registry().get("text.read"),
+            event_sink=events.append,
+            workspace_root=".",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "does not exist"):
+            wrapped(target="missing.txt")
+
+        self.assertEqual(events[-1].event_type, "tool_failed")
+        self.assertEqual(events[-1].payload["error"], "Text target does not exist.")
+        self.assertEqual(events[-1].payload["error_code"], "not_found")
+        self.assertIn("does not exist", events[-1].payload["model_error"])
 
     def test_callback_bridge_emits_attempt_failure_when_tool_never_reaches_local_execution(self) -> None:
         """provider-side tool attempt 若未进入本地执行，应产生 attempt failure 事件。"""

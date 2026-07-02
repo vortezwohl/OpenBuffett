@@ -7,14 +7,33 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from typing import Any, Callable
 
+from fileglide.exceptions import FileGlideError, NotFoundError, ScopeError
 from fileglide.facade import FileGlideFacade
 
 from src.tool.contracts import ToolContext, ToolResult, ToolSpec
 
 
 _FILEGLIDE_FACADE = FileGlideFacade()
+_MODEL_ENTRY_LIMIT = 80
+_MODEL_LINE_LIMIT = 120
+
+
+class _ReadonlyToolContractError(RuntimeError):
+    """描述只读工具的契约级失败，并保留原始诊断。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_error: str,
+        error_code: str,
+    ) -> None:
+        super().__init__(message)
+        self.raw_error = raw_error
+        self.error_code = error_code
 
 
 def _default_root(context: ToolContext, root: str | None) -> str:
@@ -26,20 +45,269 @@ def _default_root(context: ToolContext, root: str | None) -> str:
 def _build_result(name: str, payload: dict[str, Any]) -> ToolResult:
     """把 fileglide 返回值整理为统一工具结果。"""
 
-    entry = payload.get("entry", {})
-    if isinstance(entry, dict) and entry.get("relative_path"):
-        summary = str(entry["relative_path"])
-    elif "query" in payload:
-        summary = str(payload["query"])
-    elif "pattern" in payload:
-        summary = str(payload["pattern"])
-    else:
-        summary = name
+    summary = _build_summary(name, payload)
+    model_text = _build_model_text(payload)
+    metadata = {"tool_name": name}
+    if model_text:
+        metadata["model_text"] = model_text
     return ToolResult(
         content=payload,
         summary=summary,
-        metadata={"tool_name": name},
+        metadata=metadata,
     )
+
+
+def _build_summary(name: str, payload: dict[str, Any]) -> str:
+    """提取适合时间线预览的简短摘要。"""
+
+    entry = payload.get("entry", {})
+    if isinstance(entry, dict) and entry.get("relative_path"):
+        return str(entry["relative_path"])
+    entries = payload.get("entries")
+    if isinstance(entries, list):
+        return f"{len(entries)} entries"
+    if "query" in payload:
+        return str(payload["query"])
+    if "pattern" in payload:
+        return str(payload["pattern"])
+    return name
+
+
+def _build_model_text(payload: dict[str, Any]) -> str:
+    """把 fileglide payload 整理成模型可直接消费的正文。"""
+
+    lines = payload.get("lines")
+    if isinstance(lines, list) and "entry" in payload and "content" in payload:
+        return _render_text_read_payload(payload)
+    entries = payload.get("entries")
+    if isinstance(entries, list) and "scope" in payload:
+        return _render_entries_payload(payload)
+    return ""
+
+
+def _render_entries_payload(payload: dict[str, Any]) -> str:
+    """渲染目录/文件列举类结果。"""
+
+    scope = payload.get("scope", {})
+    entries = payload.get("entries", [])
+    root = str(scope.get("root", "")).strip()
+    start = str(scope.get("start", "")).strip()
+    lines = [
+        f"Scope root: {root or '.'}",
+        f"Start: {_render_scope_start(root, start)}",
+        f"Entry count: {int(payload.get('count', len(entries)) or 0)}",
+        "Entries:",
+    ]
+    if not entries:
+        lines.append("- [empty]")
+        return "\n".join(lines)
+    for entry in entries[:_MODEL_ENTRY_LIMIT]:
+        relative_path = _normalize_relative_text(
+            str(entry.get("relative_path", "")).strip()
+        )
+        kind = str(entry.get("kind", "path")).strip() or "path"
+        lines.append(f"- {relative_path} [{kind}]")
+    if len(entries) > _MODEL_ENTRY_LIMIT:
+        lines.append(
+            f"- ... {len(entries) - _MODEL_ENTRY_LIMIT} more entries omitted"
+        )
+    return "\n".join(lines)
+
+
+def _render_text_read_payload(payload: dict[str, Any]) -> str:
+    """渲染文本读取结果。"""
+
+    entry = payload.get("entry", {})
+    relative_path = _normalize_relative_text(
+        str(entry.get("relative_path") or entry.get("path") or "").strip()
+    )
+    lines_payload = payload.get("lines", [])
+    rendered = [
+        f"File: {relative_path}",
+        f"Line count: {int(payload.get('line_count', len(lines_payload)) or 0)}",
+        "Content:",
+    ]
+    if not lines_payload:
+        text = str(payload.get("content", "")).rstrip()
+        rendered.append(text or "[empty]")
+        return "\n".join(rendered)
+    for item in lines_payload[:_MODEL_LINE_LIMIT]:
+        line_number = int(item.get("line_number", 0) or 0)
+        line_text = str(item.get("text", ""))
+        rendered.append(f"{line_number}: {line_text}")
+    if len(lines_payload) > _MODEL_LINE_LIMIT:
+        rendered.append(
+            f"... {len(lines_payload) - _MODEL_LINE_LIMIT} more lines omitted"
+        )
+    return "\n".join(rendered)
+
+
+def _render_scope_start(root: str, start: str) -> str:
+    """把 scope start 渲染为更稳定的相对路径。"""
+
+    if not root or not start:
+        return _normalize_relative_text(start)
+    try:
+        relative = Path(start).resolve(strict=False).relative_to(
+            Path(root).resolve(strict=False)
+        )
+    except ValueError:
+        return _normalize_relative_text(start)
+    return _normalize_relative_text(str(relative))
+
+
+def _normalize_relative_text(value: str) -> str:
+    """统一相对路径文本表现。"""
+
+    normalized = value.replace("\\", "/").strip()
+    if normalized in {"", "."}:
+        return "."
+    return normalized
+
+
+def _normalize_readonly_scope(
+    context: ToolContext,
+    kwargs: dict[str, Any],
+    *,
+    path_key: str,
+) -> tuple[str, str]:
+    """把只读工具的绝对路径参数规范化为 root + 相对路径。"""
+
+    explicit_root = kwargs.get("root")
+    raw_value = str(kwargs.get(path_key, ".")).strip()
+    if not raw_value:
+        raw_value = "."
+    normalized_root = _default_root(context, explicit_root)
+    target_path = Path(raw_value)
+    if not target_path.is_absolute():
+        return normalized_root, raw_value
+    resolved_target = target_path.expanduser().resolve(strict=False)
+    if explicit_root is not None:
+        resolved_root = Path(explicit_root).expanduser().resolve(strict=False)
+        try:
+            relative_target = resolved_target.relative_to(resolved_root)
+        except ValueError as error:
+            raise _build_conflicting_root_error(
+                path_key=path_key,
+                resolved_root=resolved_root,
+                resolved_target=resolved_target,
+            ) from error
+        return str(resolved_root), _normalize_relative_text(str(relative_target))
+    anchor = resolved_target.anchor or str(Path("/"))
+    anchor_root = Path(anchor).expanduser().resolve(strict=False)
+    relative_target = resolved_target.relative_to(anchor_root)
+    return str(anchor_root), _normalize_relative_text(str(relative_target))
+
+
+def _build_conflicting_root_error(
+    *,
+    path_key: str,
+    resolved_root: Path,
+    resolved_target: Path,
+) -> _ReadonlyToolContractError:
+    """构造显式 root 与绝对路径冲突时的契约错误。"""
+
+    anchor = Path(resolved_target.anchor or str(Path("/"))).expanduser().resolve(
+        strict=False
+    )
+    relative_target = _normalize_relative_text(
+        str(resolved_target.relative_to(anchor))
+    )
+    suggestion = (
+        f"For example, use root=\"{anchor}\" and {path_key}=\"{relative_target}\"."
+    )
+    raw_error = (
+        f"absolute {path_key} '{resolved_target}' escapes explicit root "
+        f"'{resolved_root}'"
+    )
+    return _ReadonlyToolContractError(
+        (
+            "This call violates the root-relative path contract: "
+            f'explicit root "{resolved_root}" does not contain absolute '
+            f'{path_key} "{resolved_target}". {suggestion}'
+        ),
+        raw_error=raw_error,
+        error_code="root_path_conflict",
+    )
+
+
+def _run_readonly_operation(
+    *,
+    tool_name: str,
+    root: str,
+    path_key: str,
+    path_value: str,
+    runner: Callable[[], dict[str, Any]],
+) -> ToolResult:
+    """执行只读 fileglide 调用，并在失败时转成模型友好错误。"""
+
+    try:
+        payload = runner()
+    except Exception as error:
+        raise _wrap_readonly_error(
+            tool_name=tool_name,
+            root=root,
+            path_key=path_key,
+            path_value=path_value,
+            error=error,
+        ) from error
+    return _build_result(tool_name, payload)
+
+
+def _wrap_readonly_error(
+    *,
+    tool_name: str,
+    root: str,
+    path_key: str,
+    path_value: str,
+    error: Exception,
+) -> Exception:
+    """把底层异常转换成可恢复的只读工具失败。"""
+
+    if isinstance(error, _ReadonlyToolContractError):
+        return error
+    raw_error = str(error).strip() or error.__class__.__name__
+    if isinstance(error, ScopeError):
+        message = (
+            f"{tool_name} failed because the call violates the root-relative "
+            f'path contract. Set root to the intended scope root and pass '
+            f'{path_key} as a path relative to that root. Current root="{root}", '
+            f'{path_key}="{path_value}".'
+        )
+        return _ReadonlyToolContractError(
+            message,
+            raw_error=raw_error,
+            error_code="scope_violation",
+        )
+    if isinstance(error, NotFoundError):
+        message = (
+            f"{tool_name} failed because the requested target does not exist. "
+            f'Confirm that {path_key} exists inside the current root before '
+            f'retrying. Current root="{root}", {path_key}="{path_value}".'
+        )
+        return _ReadonlyToolContractError(
+            message,
+            raw_error=raw_error,
+            error_code="not_found",
+        )
+    if isinstance(error, PermissionError):
+        message = (
+            f"{tool_name} failed because traversal hit a protected location. "
+            f"Retry with a narrower root or {path_key}, or set recursive=false "
+            f"for a shallow exploration pass."
+        )
+        return _ReadonlyToolContractError(
+            message,
+            raw_error=raw_error,
+            error_code="permission_denied",
+        )
+    if isinstance(error, FileGlideError):
+        return _ReadonlyToolContractError(
+            f"{tool_name} failed: {raw_error}",
+            raw_error=raw_error,
+            error_code=getattr(error, "code", "fileglide_error"),
+        )
+    return error
 
 
 def _object_schema(
@@ -73,6 +341,93 @@ def _tool_spec(
         handler=handler,
         tool_kind="fileglide",
     )
+
+
+def _tool_description(
+    *,
+    purpose: str,
+    when_to_use: tuple[str, ...],
+    parameters: tuple[str, ...],
+    returns: tuple[str, ...],
+    common_failures: tuple[str, ...],
+) -> str:
+    """Build a detailed English tool description."""
+
+    sections: list[tuple[str, tuple[str, ...]]] = [
+        ("Purpose", (purpose,)),
+        ("When to use", when_to_use),
+        ("Parameters", parameters),
+        ("Returns", returns),
+        ("Common failures", common_failures),
+    ]
+    lines: list[str] = []
+    for title, bullets in sections:
+        lines.append(f"{title}:")
+        lines.extend(f"- {bullet}" for bullet in bullets)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+_ROOT_SCOPE_PARAMETER = (
+    "`root`: Scope root used to resolve every relative path. Omit it to use "
+    "the current agent workspace root."
+)
+_TARGET_PATH_PARAMETER = (
+    "`target`: Path relative to `root`. Use an absolute path only when you "
+    "intend the wrapper to normalize it into a scope root plus a root-relative "
+    "target."
+)
+_START_PATH_PARAMETER = (
+    "`start`: Traversal start path relative to `root`. Use `.` to start at the "
+    "scope root itself."
+)
+_RECURSIVE_PARAMETER = (
+    "`recursive`: Whether traversal should descend into subdirectories. Omit it "
+    "to keep exploration shallow for safer recovery."
+)
+_MAX_DEPTH_PARAMETER = (
+    "`max_depth`: Optional recursion depth cap. Omit it when you want the tool "
+    "to use its natural depth behavior."
+)
+_INCLUDE_PARAMETER = (
+    "`include`: Optional glob filters that must match for an entry to be "
+    "returned."
+)
+_EXCLUDE_PARAMETER = (
+    "`exclude`: Optional glob filters that suppress matching entries."
+)
+_COMMON_SCOPE_FAILURES = (
+    "Scope violation: the requested path escapes the current root. Retry with "
+    "the correct root anchor and a root-relative path.",
+    "Target missing: the requested start path or file does not exist inside "
+    "the current root.",
+)
+_COMMON_LIST_FAILURES = _COMMON_SCOPE_FAILURES + (
+    "Permission denied: traversal reached a protected location. Retry with a "
+    "narrower `root`, a narrower `start`, or `recursive=false`.",
+)
+_ENTRY_RETURN = (
+    "`entry`: Metadata for the target path. Expected fields include `path`, "
+    "`relative_path`, `name`, `kind`, and `exists`."
+)
+_LIST_RETURNS = (
+    "`entries`: Listed entries. Each entry includes `path`, `relative_path`, "
+    "`name`, `kind`, `exists`, `depth`, and `size_bytes`.",
+    "`scope`: Effective traversal scope, including `root`, `start`, "
+    "`recursive`, `max_depth`, `include`, `exclude`, and `kind`.",
+    "`count`: Number of returned entries.",
+)
+_SEARCH_RETURNS = (
+    "`matches`: Matching entries returned by the search operation.",
+    "`scope`: Effective traversal scope used during the search.",
+    "`query` or `pattern`: The search expression that was executed.",
+    "`count`: Number of returned matches.",
+)
+_WRITE_RETURNS = (
+    _ENTRY_RETURN,
+    "`encoding`: Encoding that was used or detected for the write operation.",
+    "`verification`: Post-write verification metadata from fileglide.",
+)
 
 
 def _run_file_create(context: ToolContext, **kwargs) -> ToolResult:
@@ -117,32 +472,52 @@ def _run_file_exists(context: ToolContext, **kwargs) -> ToolResult:
 
 
 def _run_file_list(context: ToolContext, **kwargs) -> ToolResult:
-    payload = _FILEGLIDE_FACADE.traversal.list_entries(
-        _default_root(context, kwargs.get("root")),
-        start=kwargs.get("start", "."),
-        kind="file",
-        recursive=kwargs.get("recursive", True),
-        max_depth=kwargs.get("max_depth"),
-        include=tuple(kwargs.get("include", [])),
-        exclude=tuple(kwargs.get("exclude", [])),
+    root, start = _normalize_readonly_scope(
+        context,
+        kwargs,
+        path_key="start",
     )
-    return _build_result("file.list", payload)
+    return _run_readonly_operation(
+        tool_name="file.list",
+        root=root,
+        path_key="start",
+        path_value=start,
+        runner=lambda: _FILEGLIDE_FACADE.traversal.list_entries(
+            root,
+            start=start,
+            kind="file",
+            recursive=kwargs.get("recursive", False),
+            max_depth=kwargs.get("max_depth"),
+            include=tuple(kwargs.get("include", [])),
+            exclude=tuple(kwargs.get("exclude", [])),
+        ),
+    )
 
 
 def _run_file_search(context: ToolContext, **kwargs) -> ToolResult:
-    payload = _FILEGLIDE_FACADE.search.search_names(
-        _default_root(context, kwargs.get("root")),
-        query=kwargs["query"],
-        mode=kwargs.get("mode", "contains"),
-        start=kwargs.get("start", "."),
-        kind="file",
-        recursive=kwargs.get("recursive", True),
-        max_depth=kwargs.get("max_depth"),
-        include=tuple(kwargs.get("include", [])),
-        exclude=tuple(kwargs.get("exclude", [])),
-        limit=kwargs.get("limit", 50),
+    root, start = _normalize_readonly_scope(
+        context,
+        kwargs,
+        path_key="start",
     )
-    return _build_result("file.search", payload)
+    return _run_readonly_operation(
+        tool_name="file.search",
+        root=root,
+        path_key="start",
+        path_value=start,
+        runner=lambda: _FILEGLIDE_FACADE.search.search_names(
+            root,
+            query=kwargs["query"],
+            mode=kwargs.get("mode", "contains"),
+            start=start,
+            kind="file",
+            recursive=kwargs.get("recursive", True),
+            max_depth=kwargs.get("max_depth"),
+            include=tuple(kwargs.get("include", [])),
+            exclude=tuple(kwargs.get("exclude", [])),
+            limit=kwargs.get("limit", 50),
+        ),
+    )
 
 
 def _run_path_create(context: ToolContext, **kwargs) -> ToolResult:
@@ -188,56 +563,96 @@ def _run_path_exists(context: ToolContext, **kwargs) -> ToolResult:
 
 
 def _run_path_list(context: ToolContext, **kwargs) -> ToolResult:
-    payload = _FILEGLIDE_FACADE.traversal.list_entries(
-        _default_root(context, kwargs.get("root")),
-        start=kwargs.get("start", "."),
-        kind=kwargs.get("kind", "directory"),
-        recursive=kwargs.get("recursive", True),
-        max_depth=kwargs.get("max_depth"),
-        include=tuple(kwargs.get("include", [])),
-        exclude=tuple(kwargs.get("exclude", [])),
+    root, start = _normalize_readonly_scope(
+        context,
+        kwargs,
+        path_key="start",
     )
-    return _build_result("path.list", payload)
+    return _run_readonly_operation(
+        tool_name="path.list",
+        root=root,
+        path_key="start",
+        path_value=start,
+        runner=lambda: _FILEGLIDE_FACADE.traversal.list_entries(
+            root,
+            start=start,
+            kind=kwargs.get("kind", "directory"),
+            recursive=kwargs.get("recursive", False),
+            max_depth=kwargs.get("max_depth"),
+            include=tuple(kwargs.get("include", [])),
+            exclude=tuple(kwargs.get("exclude", [])),
+        ),
+    )
 
 
 def _run_path_search(context: ToolContext, **kwargs) -> ToolResult:
-    payload = _FILEGLIDE_FACADE.search.search_names(
-        _default_root(context, kwargs.get("root")),
-        query=kwargs["query"],
-        mode=kwargs.get("mode", "contains"),
-        start=kwargs.get("start", "."),
-        kind=kwargs.get("kind", "all"),
-        recursive=kwargs.get("recursive", True),
-        max_depth=kwargs.get("max_depth"),
-        include=tuple(kwargs.get("include", [])),
-        exclude=tuple(kwargs.get("exclude", [])),
-        limit=kwargs.get("limit", 50),
+    root, start = _normalize_readonly_scope(
+        context,
+        kwargs,
+        path_key="start",
     )
-    return _build_result("path.search", payload)
+    return _run_readonly_operation(
+        tool_name="path.search",
+        root=root,
+        path_key="start",
+        path_value=start,
+        runner=lambda: _FILEGLIDE_FACADE.search.search_names(
+            root,
+            query=kwargs["query"],
+            mode=kwargs.get("mode", "contains"),
+            start=start,
+            kind=kwargs.get("kind", "all"),
+            recursive=kwargs.get("recursive", True),
+            max_depth=kwargs.get("max_depth"),
+            include=tuple(kwargs.get("include", [])),
+            exclude=tuple(kwargs.get("exclude", [])),
+            limit=kwargs.get("limit", 50),
+        ),
+    )
 
 
 def _run_tree_list(context: ToolContext, **kwargs) -> ToolResult:
-    payload = _FILEGLIDE_FACADE.traversal.list_entries(
-        _default_root(context, kwargs.get("root")),
-        start=kwargs.get("start", "."),
-        kind=kwargs.get("kind", "all"),
-        recursive=kwargs.get("recursive", True),
-        max_depth=kwargs.get("max_depth"),
-        include=tuple(kwargs.get("include", [])),
-        exclude=tuple(kwargs.get("exclude", [])),
+    root, start = _normalize_readonly_scope(
+        context,
+        kwargs,
+        path_key="start",
     )
-    return _build_result("tree.list", payload)
+    return _run_readonly_operation(
+        tool_name="tree.list",
+        root=root,
+        path_key="start",
+        path_value=start,
+        runner=lambda: _FILEGLIDE_FACADE.traversal.list_entries(
+            root,
+            start=start,
+            kind=kwargs.get("kind", "all"),
+            recursive=kwargs.get("recursive", True),
+            max_depth=kwargs.get("max_depth"),
+            include=tuple(kwargs.get("include", [])),
+            exclude=tuple(kwargs.get("exclude", [])),
+        ),
+    )
 
 
 def _run_text_read(context: ToolContext, **kwargs) -> ToolResult:
-    payload = _FILEGLIDE_FACADE.text.read_text(
-        _default_root(context, kwargs.get("root")),
-        kwargs["target"],
-        encoding=kwargs.get("encoding"),
-        start_line=kwargs.get("start_line"),
-        end_line=kwargs.get("end_line"),
+    root, target = _normalize_readonly_scope(
+        context,
+        kwargs,
+        path_key="target",
     )
-    return _build_result("text.read", payload)
+    return _run_readonly_operation(
+        tool_name="text.read",
+        root=root,
+        path_key="target",
+        path_value=target,
+        runner=lambda: _FILEGLIDE_FACADE.text.read_text(
+            root,
+            target,
+            encoding=kwargs.get("encoding"),
+            start_line=kwargs.get("start_line"),
+            end_line=kwargs.get("end_line"),
+        ),
+    )
 
 
 def _run_text_write(context: ToolContext, **kwargs) -> ToolResult:
@@ -280,17 +695,27 @@ def _run_text_insert_anchor(context: ToolContext, **kwargs) -> ToolResult:
 
 
 def _run_text_grep(context: ToolContext, **kwargs) -> ToolResult:
-    payload = _FILEGLIDE_FACADE.search.regex_search(
-        _default_root(context, kwargs.get("root")),
-        pattern=kwargs["pattern"],
-        start=kwargs.get("start", "."),
-        recursive=kwargs.get("recursive", True),
-        max_depth=kwargs.get("max_depth"),
-        include=tuple(kwargs.get("include", [])),
-        exclude=tuple(kwargs.get("exclude", [])),
-        encoding=kwargs.get("encoding"),
+    root, start = _normalize_readonly_scope(
+        context,
+        kwargs,
+        path_key="start",
     )
-    return _build_result("text.grep", payload)
+    return _run_readonly_operation(
+        tool_name="text.grep",
+        root=root,
+        path_key="start",
+        path_value=start,
+        runner=lambda: _FILEGLIDE_FACADE.search.regex_search(
+            root,
+            pattern=kwargs["pattern"],
+            start=start,
+            recursive=kwargs.get("recursive", True),
+            max_depth=kwargs.get("max_depth"),
+            include=tuple(kwargs.get("include", [])),
+            exclude=tuple(kwargs.get("exclude", [])),
+            encoding=kwargs.get("encoding"),
+        ),
+    )
 
 
 def _run_text_binary_write(context: ToolContext, **kwargs) -> ToolResult:
@@ -356,7 +781,28 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
     return (
         _tool_spec(
             name="file.create",
-            description="Create an empty file inside the local workspace.",
+            description=_tool_description(
+                purpose="Create an empty file inside a scoped root.",
+                when_to_use=(
+                    "You need a file to exist before another step writes or moves content.",
+                    "You want a filesystem-safe alternative to shell redirection for bootstrapping a file path.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`parents`: Create missing parent directories before creating the file.",
+                    "`exist_ok`: Allow the operation to succeed when the file already exists.",
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "`created`: Whether this call created a new file.",
+                ),
+                common_failures=(
+                    "Target already exists and `exist_ok` is false.",
+                    "Parent directories are missing and `parents` is false.",
+                    *_COMMON_SCOPE_FAILURES,
+                ),
+            ),
             display_name="File create",
             input_schema=_object_schema(
                 {
@@ -371,7 +817,29 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="file.delete",
-            description="Delete a file with optional dry-run and confirmation.",
+            description=_tool_description(
+                purpose="Delete a file inside a scoped root with explicit safety controls.",
+                when_to_use=(
+                    "You want to remove one file without invoking shell commands.",
+                    "You need a dry-run or explicit confirmation step before destructive file removal.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`dry_run`: Preview the deletion without mutating the filesystem.",
+                    "`confirm`: Required confirmation flag for destructive execution.",
+                    "`missing_ok`: Treat a missing target as a successful no-op.",
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "`preview` or equivalent delete metadata describing the removal plan or result.",
+                ),
+                common_failures=(
+                    "Deletion requires confirmation and `confirm` is false.",
+                    "Target is missing and `missing_ok` is false.",
+                    *_COMMON_SCOPE_FAILURES,
+                ),
+            ),
             display_name="File delete",
             input_schema=_object_schema(
                 {
@@ -387,7 +855,31 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="file.move",
-            description="Move a file within the local workspace.",
+            description=_tool_description(
+                purpose="Move or rename a file between scoped locations.",
+                when_to_use=(
+                    "You need to rename a file or move it to another directory.",
+                    "You want an explicit, scope-aware move operation instead of shell-level path manipulation.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    "`source`: Source path relative to `root`.",
+                    "`destination`: Destination path relative to `destination_root` when provided, otherwise relative to `root`.",
+                    "`destination_root`: Optional alternate scope root for the destination side of the move.",
+                    "`dry_run`: Preview the move without mutating the filesystem.",
+                    "`confirm`: Required confirmation flag when the underlying operation demands it.",
+                ),
+                returns=(
+                    "`source_entry` or equivalent source metadata describing what moved.",
+                    "`destination_entry` or equivalent destination metadata describing the final path.",
+                    "Additional move metadata from fileglide, such as preview or confirmation state.",
+                ),
+                common_failures=(
+                    "Source is missing inside the current root.",
+                    "Destination escapes the allowed root or destination root.",
+                    "A destructive move requires confirmation and `confirm` is false.",
+                ),
+            ),
             display_name="File move",
             input_schema=_object_schema(
                 {
@@ -404,7 +896,22 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="file.exists",
-            description="Check whether a file exists in the local workspace.",
+            description=_tool_description(
+                purpose="Check whether a file exists inside a scoped root.",
+                when_to_use=(
+                    "You need a cheap existence check before reading, writing, moving, or deleting.",
+                    "You want the tool to resolve a root-relative file path and report canonical metadata.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "The `exists` field inside `entry`, which tells you whether the target currently exists.",
+                ),
+                common_failures=_COMMON_SCOPE_FAILURES,
+            ),
             display_name="File exists",
             input_schema=_object_schema(
                 {
@@ -417,7 +924,23 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="file.list",
-            description="List files under a root or subdirectory.",
+            description=_tool_description(
+                purpose="List files inside a scoped root without opening file contents.",
+                when_to_use=(
+                    "You need to inspect which files exist before reading, editing, or moving them.",
+                    "You want a narrow exploration step near a drive root or large directory tree.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _START_PATH_PARAMETER,
+                    _RECURSIVE_PARAMETER,
+                    _MAX_DEPTH_PARAMETER,
+                    _INCLUDE_PARAMETER,
+                    _EXCLUDE_PARAMETER,
+                ),
+                returns=_LIST_RETURNS,
+                common_failures=_COMMON_LIST_FAILURES,
+            ),
             display_name="File list",
             input_schema=_object_schema(
                 {
@@ -433,7 +956,26 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="file.search",
-            description="Search file names under a root or subdirectory.",
+            description=_tool_description(
+                purpose="Search file names inside a scoped root.",
+                when_to_use=(
+                    "You know part of a file name but not its exact location.",
+                    "You want a search-oriented alternative to listing every file manually.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    "`query`: Search text to match against file names.",
+                    "`mode`: Matching mode. Use `exact`, `contains`, or `fuzzy` depending on how precise the name is.",
+                    _START_PATH_PARAMETER,
+                    _RECURSIVE_PARAMETER,
+                    _MAX_DEPTH_PARAMETER,
+                    _INCLUDE_PARAMETER,
+                    _EXCLUDE_PARAMETER,
+                    "`limit`: Maximum number of matches to return.",
+                ),
+                returns=_SEARCH_RETURNS,
+                common_failures=_COMMON_LIST_FAILURES,
+            ),
             display_name="File search",
             input_schema=_object_schema(
                 {
@@ -453,7 +995,28 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="path.create",
-            description="Create a directory inside the local workspace.",
+            description=_tool_description(
+                purpose="Create a directory inside a scoped root.",
+                when_to_use=(
+                    "You need a destination directory before writing files or moving content.",
+                    "You want a scope-aware directory creation step instead of shell commands.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`parents`: Create missing parent directories as needed.",
+                    "`exist_ok`: Allow the operation to succeed if the directory already exists.",
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "`created`: Whether this call created a new directory.",
+                ),
+                common_failures=(
+                    "Target already exists and `exist_ok` is false.",
+                    "Parent directories are missing and `parents` is false.",
+                    *_COMMON_SCOPE_FAILURES,
+                ),
+            ),
             display_name="Path create",
             input_schema=_object_schema(
                 {
@@ -468,7 +1031,31 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="path.delete",
-            description="Delete a directory with optional recursion.",
+            description=_tool_description(
+                purpose="Delete a directory inside a scoped root with explicit safety controls.",
+                when_to_use=(
+                    "You need to remove a directory tree through a guarded API.",
+                    "You want dry-run, confirmation, or missing-target behavior instead of ad hoc shell deletion.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`recursive`: Delete nested content instead of only an empty directory.",
+                    "`dry_run`: Preview the deletion without mutating the filesystem.",
+                    "`confirm`: Required confirmation flag for destructive execution.",
+                    "`missing_ok`: Treat a missing target as a successful no-op.",
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "`preview` or equivalent delete metadata describing the removal plan or result.",
+                ),
+                common_failures=(
+                    "Deletion requires confirmation and `confirm` is false.",
+                    "Target is missing and `missing_ok` is false.",
+                    "A non-empty directory requires `recursive=true`.",
+                    *_COMMON_SCOPE_FAILURES,
+                ),
+            ),
             display_name="Path delete",
             input_schema=_object_schema(
                 {
@@ -485,7 +1072,31 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="path.move",
-            description="Move a directory within the local workspace.",
+            description=_tool_description(
+                purpose="Move or rename a directory between scoped locations.",
+                when_to_use=(
+                    "You need to rename a directory or relocate it under another parent path.",
+                    "You want a root-aware directory move instead of manual shell path handling.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    "`source`: Source path relative to `root`.",
+                    "`destination`: Destination path relative to `destination_root` when provided, otherwise relative to `root`.",
+                    "`destination_root`: Optional alternate scope root for the destination side of the move.",
+                    "`dry_run`: Preview the move without mutating the filesystem.",
+                    "`confirm`: Required confirmation flag when the underlying operation demands it.",
+                ),
+                returns=(
+                    "`source_entry` or equivalent source metadata describing what moved.",
+                    "`destination_entry` or equivalent destination metadata describing the final path.",
+                    "Additional move metadata from fileglide, such as preview or confirmation state.",
+                ),
+                common_failures=(
+                    "Source is missing inside the current root.",
+                    "Destination escapes the allowed root or destination root.",
+                    "A destructive move requires confirmation and `confirm` is false.",
+                ),
+            ),
             display_name="Path move",
             input_schema=_object_schema(
                 {
@@ -502,7 +1113,22 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="path.exists",
-            description="Check whether a path exists in the local workspace.",
+            description=_tool_description(
+                purpose="Check whether any filesystem path exists inside a scoped root.",
+                when_to_use=(
+                    "You need a quick existence check before creating, moving, reading, or deleting a path.",
+                    "You want normalized metadata for a path that might be either a file or a directory.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "The `exists` field inside `entry`, which tells you whether the target currently exists.",
+                ),
+                common_failures=_COMMON_SCOPE_FAILURES,
+            ),
             display_name="Path exists",
             input_schema=_object_schema(
                 {
@@ -515,7 +1141,24 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="path.list",
-            description="List directories or mixed paths under a root.",
+            description=_tool_description(
+                purpose="List directories or mixed paths inside a scoped root.",
+                when_to_use=(
+                    "You need the high-level shape of a directory tree before reading files.",
+                    "You want the safest first exploration step near a drive root, repository root, or large directory.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _START_PATH_PARAMETER,
+                    "`kind`: Entry kind filter. Use `directory` for folder-only exploration or `all` for mixed entries.",
+                    _RECURSIVE_PARAMETER,
+                    _MAX_DEPTH_PARAMETER,
+                    _INCLUDE_PARAMETER,
+                    _EXCLUDE_PARAMETER,
+                ),
+                returns=_LIST_RETURNS,
+                common_failures=_COMMON_LIST_FAILURES,
+            ),
             display_name="Path list",
             input_schema=_object_schema(
                 {
@@ -532,7 +1175,27 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="path.search",
-            description="Search file or directory names under a root.",
+            description=_tool_description(
+                purpose="Search file or directory names inside a scoped root.",
+                when_to_use=(
+                    "You know part of a path name but not where it lives.",
+                    "You want to search both files and directories before deciding which one to inspect next.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    "`query`: Search text to match against path names.",
+                    "`mode`: Matching mode. Use `exact`, `contains`, or `fuzzy`.",
+                    "`kind`: Whether to search `all` entries or only `directory` entries.",
+                    _START_PATH_PARAMETER,
+                    _RECURSIVE_PARAMETER,
+                    _MAX_DEPTH_PARAMETER,
+                    _INCLUDE_PARAMETER,
+                    _EXCLUDE_PARAMETER,
+                    "`limit`: Maximum number of matches to return.",
+                ),
+                returns=_SEARCH_RETURNS,
+                common_failures=_COMMON_LIST_FAILURES,
+            ),
             display_name="Path search",
             input_schema=_object_schema(
                 {
@@ -553,7 +1216,24 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="tree.list",
-            description="Traverse mixed files and directories under a root.",
+            description=_tool_description(
+                purpose="Traverse mixed files and directories inside a scoped root.",
+                when_to_use=(
+                    "You need a combined view of files and directories in one traversal step.",
+                    "You want a tree-like inventory before choosing narrower list or read operations.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _START_PATH_PARAMETER,
+                    "`kind`: Entry kind filter. Use `all`, `file`, or `directory`.",
+                    _RECURSIVE_PARAMETER,
+                    _MAX_DEPTH_PARAMETER,
+                    _INCLUDE_PARAMETER,
+                    _EXCLUDE_PARAMETER,
+                ),
+                returns=_LIST_RETURNS,
+                common_failures=_COMMON_LIST_FAILURES,
+            ),
             display_name="Tree list",
             input_schema=_object_schema(
                 {
@@ -570,7 +1250,33 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="text.read",
-            description="Read a text file or a selected line range.",
+            description=_tool_description(
+                purpose="Read text content from a file inside a scoped root.",
+                when_to_use=(
+                    "You need file contents to understand or edit code, config, or documentation.",
+                    "You want a line-aware read step instead of dumping an entire file blindly.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`encoding`: Optional override for the expected text encoding.",
+                    "`start_line`: First 1-based line number to include when you need a partial read.",
+                    "`end_line`: Last 1-based line number to include when you need a partial read.",
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "`content`: The selected text body.",
+                    "`lines`: Line-aware representation of the selected content, with `line_number` and `text` fields.",
+                    "`line_count`: Number of lines in the returned selection.",
+                    "`selection`: Selection metadata when a partial line range is used.",
+                    "`encoding`: Encoding details used for decoding the file.",
+                ),
+                common_failures=(
+                    *_COMMON_SCOPE_FAILURES,
+                    "Target is binary or cannot be decoded with the effective encoding.",
+                    "The requested line range is invalid for the current file.",
+                ),
+            ),
             display_name="Text read",
             input_schema=_object_schema(
                 {
@@ -586,7 +1292,33 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="text.write",
-            description="Write text by overwrite, append, or insert mode.",
+            description=_tool_description(
+                purpose="Write text content to a file inside a scoped root.",
+                when_to_use=(
+                    "You need to create, replace, append, or insert text without leaving the fileglide tool chain.",
+                    "You want fileglide verification metadata after a text write.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`content`: Text to write into the target file.",
+                    "`mode`: Write mode. Use `overwrite`, `append`, or `insert`.",
+                    "`encoding`: Optional output encoding override.",
+                    "`position`: Byte or character insertion position used when `mode` is `insert`.",
+                ),
+                returns=(
+                    *_WRITE_RETURNS,
+                    "`write_mode`: Effective write mode used by the operation.",
+                    "`before_size_bytes` and `after_size_bytes`: File sizes before and after the write.",
+                    "`insert_position`: Final insertion position when insert mode is used.",
+                    "`content_source`: Metadata describing where the written content came from.",
+                ),
+                common_failures=(
+                    *_COMMON_SCOPE_FAILURES,
+                    "Encoding risk: the write cannot be completed safely with the requested encoding.",
+                    "Insert mode requires a valid insertion position inside the target file.",
+                ),
+            ),
             display_name="Text write",
             input_schema=_object_schema(
                 {
@@ -603,7 +1335,33 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="text.replace-lines",
-            description="Replace a logical line range in a text file.",
+            description=_tool_description(
+                purpose="Replace a logical line range inside a text file.",
+                when_to_use=(
+                    "You know the exact line span to rewrite and want a deterministic edit.",
+                    "You want a safer alternative to ad hoc regex replacement for line-bounded changes.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`start_line`: First 1-based line number to replace.",
+                    "`end_line`: Last 1-based line number to replace.",
+                    "`content`: Replacement text for the selected line range.",
+                    "`encoding`: Optional encoding override for the edit.",
+                ),
+                returns=(
+                    *_WRITE_RETURNS,
+                    "`changed_range`: The final line range that was replaced.",
+                    "`replacement_line_count`: Number of logical lines inserted by the replacement content.",
+                    "`after_size_bytes`: File size after the replacement.",
+                    "`content_source`: Metadata describing where the replacement content came from.",
+                ),
+                common_failures=(
+                    *_COMMON_SCOPE_FAILURES,
+                    "The requested line range is invalid for the current file.",
+                    "Encoding risk: the replacement cannot be completed safely with the requested encoding.",
+                ),
+            ),
             display_name="Text replace lines",
             input_schema=_object_schema(
                 {
@@ -620,7 +1378,34 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="text.insert-anchor",
-            description="Insert text before or after a unique anchor.",
+            description=_tool_description(
+                purpose="Insert text before or after a unique anchor inside a text file.",
+                when_to_use=(
+                    "You know a stable anchor string but not an exact line number.",
+                    "You want deterministic insertion semantics around a unique marker.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`anchor`: Unique anchor text that identifies the insertion point.",
+                    "`content`: Text to insert around the anchor.",
+                    "`before`: Insert before the anchor when true; otherwise insert after it.",
+                    "`encoding`: Optional encoding override for the edit.",
+                ),
+                returns=(
+                    *_WRITE_RETURNS,
+                    "`anchor`: The anchor text used for the insertion.",
+                    "`insert_position`: Final insertion position resolved from the anchor.",
+                    "`write_mode`: Effective insertion mode used by fileglide.",
+                    "`after_size_bytes`: File size after the insertion.",
+                    "`content_source`: Metadata describing where the inserted content came from.",
+                ),
+                common_failures=(
+                    *_COMMON_SCOPE_FAILURES,
+                    "The anchor is missing or not unique enough for a deterministic insertion.",
+                    "Encoding risk: the insertion cannot be completed safely with the requested encoding.",
+                ),
+            ),
             display_name="Text insert anchor",
             input_schema=_object_schema(
                 {
@@ -637,7 +1422,34 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="text.grep",
-            description="Search text content with a regular expression.",
+            description=_tool_description(
+                purpose="Search text content with a regular expression inside a scoped root.",
+                when_to_use=(
+                    "You need to find matching text before deciding which file or line range to read next.",
+                    "You want content-aware discovery instead of file-name-only search.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    "`pattern`: Regular expression used to match text content.",
+                    _START_PATH_PARAMETER,
+                    _RECURSIVE_PARAMETER,
+                    _MAX_DEPTH_PARAMETER,
+                    _INCLUDE_PARAMETER,
+                    _EXCLUDE_PARAMETER,
+                    "`encoding`: Optional encoding override for text decoding during search.",
+                ),
+                returns=(
+                    "`matches`: Matching text hits returned by the search operation.",
+                    "`scope`: Effective traversal scope used during the search.",
+                    "`pattern`: The regular expression that was executed.",
+                    "`count`: Number of returned matches.",
+                ),
+                common_failures=(
+                    *_COMMON_LIST_FAILURES,
+                    "The regular expression is invalid.",
+                    "A matching file cannot be decoded with the effective encoding.",
+                ),
+            ),
             display_name="Text grep",
             input_schema=_object_schema(
                 {
@@ -656,7 +1468,31 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="text.binary-write",
-            description="Write binary bytes from a base64 payload.",
+            description=_tool_description(
+                purpose="Write binary bytes to a file from a base64 payload.",
+                when_to_use=(
+                    "You need to create or replace binary content without text decoding.",
+                    "You already have bytes encoded as base64 and want a filesystem-safe write step.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`data_base64`: Base64-encoded bytes to write.",
+                    "`mode`: Write mode. Use `overwrite`, `append`, or `insert`.",
+                    "`offset`: Optional byte offset for insert or partial-write flows.",
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "`write_mode`: Effective binary write mode used by the operation.",
+                    "`content_source`: Metadata describing the base64 input source.",
+                    "`before_size_bytes` and `after_size_bytes`: File sizes before and after the write.",
+                ),
+                common_failures=(
+                    *_COMMON_SCOPE_FAILURES,
+                    "The base64 payload is invalid or cannot be decoded.",
+                    "Insert mode or offset usage is invalid for the current target.",
+                ),
+            ),
             display_name="Binary write",
             input_schema=_object_schema(
                 {
@@ -672,7 +1508,28 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="text.binary-copy",
-            description="Copy a binary file without text decoding.",
+            description=_tool_description(
+                purpose="Copy a binary file without text decoding.",
+                when_to_use=(
+                    "You need an exact byte-for-byte copy of a binary asset.",
+                    "You want to avoid accidental text decoding or newline normalization.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    "`source`: Source path relative to `root`.",
+                    "`destination`: Destination path relative to `root`.",
+                ),
+                returns=(
+                    "`source_entry` or equivalent source metadata describing what was copied.",
+                    "`destination_entry` or equivalent destination metadata describing the copied target.",
+                    "Binary copy metadata from fileglide, including resulting size information when available.",
+                ),
+                common_failures=(
+                    *_COMMON_SCOPE_FAILURES,
+                    "The source file is missing.",
+                    "The destination path is invalid or blocked by filesystem permissions.",
+                ),
+            ),
             display_name="Binary copy",
             input_schema=_object_schema(
                 {
@@ -686,7 +1543,23 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="inspect.size",
-            description="Inspect file size or aggregated directory size.",
+            description=_tool_description(
+                purpose="Inspect the size of a file or the aggregated size of a directory.",
+                when_to_use=(
+                    "You need byte-size information before reading, copying, or editing content.",
+                    "You want a structured size inspection instead of a shell-specific stat command.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "`size_bytes`: Size of the target in bytes.",
+                    "`aggregate`: Aggregated sizing metadata when the target is a directory.",
+                ),
+                common_failures=_COMMON_SCOPE_FAILURES,
+            ),
             display_name="Inspect size",
             input_schema=_object_schema(
                 {
@@ -699,7 +1572,31 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="inspect.bytes",
-            description="Inspect binary bytes as hexadecimal content.",
+            description=_tool_description(
+                purpose="Inspect a binary slice and return it as hexadecimal content.",
+                when_to_use=(
+                    "You need to inspect raw bytes without decoding them as text.",
+                    "You want a bounded binary preview before modifying or copying a file.",
+                ),
+                parameters=(
+                    _ROOT_SCOPE_PARAMETER,
+                    _TARGET_PATH_PARAMETER,
+                    "`offset`: Byte offset where the binary read should begin.",
+                    "`length`: Optional number of bytes to read from the offset.",
+                ),
+                returns=(
+                    _ENTRY_RETURN,
+                    "`content_hex`: Hexadecimal representation of the selected byte slice.",
+                    "`offset`: Effective read offset.",
+                    "`length`: Number of bytes that were read.",
+                    "`size_bytes`: Total size of the underlying file.",
+                ),
+                common_failures=(
+                    *_COMMON_SCOPE_FAILURES,
+                    "The target is missing or is not readable as a binary source.",
+                    "The requested offset or length falls outside the valid byte range.",
+                ),
+            ),
             display_name="Inspect bytes",
             input_schema=_object_schema(
                 {
@@ -714,7 +1611,27 @@ def build_fileglide_tool_specs() -> tuple[ToolSpec, ...]:
         ),
         _tool_spec(
             name="batch.run",
-            description="Execute or preview a fileglide batch plan.",
+            description=_tool_description(
+                purpose="Execute or preview a multi-step fileglide batch plan.",
+                when_to_use=(
+                    "You need to coordinate several fileglide actions as one structured plan.",
+                    "You want to inspect destructive steps in dry-run mode before execution.",
+                ),
+                parameters=(
+                    "`plan`: Batch plan object. The `steps` array describes each action and its arguments.",
+                    "`dry_run`: Preview the plan without mutating the filesystem when true.",
+                ),
+                returns=(
+                    "`steps`: Per-step execution or preview results from the batch engine.",
+                    "`summary` or equivalent batch metadata describing the overall outcome.",
+                    "`preview`: Dry-run details when the plan is executed in preview mode.",
+                ),
+                common_failures=(
+                    "A step action is unsupported by the batch adapter.",
+                    "A step argument set does not match the target fileglide action.",
+                    "An executed step fails with the underlying fileglide error for that action.",
+                ),
+            ),
             display_name="Batch run",
             input_schema=_object_schema(
                 {
