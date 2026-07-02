@@ -14,7 +14,11 @@ from unittest.mock import patch
 
 from src.core.agent import Agent
 from src.core.events import LoopEvent, build_loop_event
-from src.core.strands_runtime import StrandsRunResult
+from src.core.strands_runtime import (
+    StrandsRunResult,
+    build_strands_tool,
+    build_strands_tools,
+)
 from src.model_config import AGENT_SESSION_ROUND, BRAIN_MODEL_CONFIGS, CHANNEL_CONFIGS
 from src.service.model_hub import create_default_brain_model, validate_model_config
 from src.tool.contracts import ToolContext, ToolResult, ToolSpec
@@ -102,8 +106,8 @@ class _FakeFileIoRuntime:
 
         class _Runner:
             def run(self, prompt: str) -> StrandsRunResult:
-                tool_map["text.write"](target="note.txt", content=prompt)
-                tool_map["text.read"](target="note.txt")
+                tool_map["text_write"](target="note.txt", content=prompt)
+                tool_map["text_read"](target="note.txt")
                 return StrandsRunResult(text="file done")
 
         return _Runner()
@@ -276,6 +280,60 @@ class SessionRuntimeTests(unittest.TestCase):
             note_path = Path(temp_dir) / "note.txt"
             self.assertTrue(note_path.exists())
             self.assertEqual(note_path.read_text(encoding="utf-8"), "hello from fileglide")
+
+    def test_provider_tool_name_is_sanitized_but_events_keep_internal_name(self) -> None:
+        """provider-facing 工具名应合法化，但事件仍保留内部工具名。"""
+
+        events: list[LoopEvent] = []
+
+        def _handler(_context: ToolContext, **kwargs) -> ToolResult:
+            return ToolResult(content=kwargs, summary="ok")
+
+        wrapped = build_strands_tool(
+            tool_spec=ToolSpec(
+                name="text.write",
+                description="write text",
+                display_name="Text write",
+                input_schema={"type": "object", "properties": {}},
+                handler=_handler,
+                tool_kind="fileglide",
+            ),
+            event_sink=events.append,
+        )
+
+        self.assertEqual(wrapped.tool_name, "text_write")
+
+        result = wrapped(target="note.txt", content="hello")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(events[0].payload["tool_name"], "text.write")
+        self.assertEqual(events[1].payload["tool_name"], "text.write")
+
+    def test_provider_tool_name_collision_fails_fast(self) -> None:
+        """不同内部工具名若映射到同一 provider 名，应立即失败。"""
+
+        def _handler(_context: ToolContext, **_kwargs) -> ToolResult:
+            return ToolResult(content="ok", summary="ok")
+
+        with self.assertRaisesRegex(RuntimeError, "同一个 provider 工具名"):
+            build_strands_tools(
+                tool_specs=[
+                    ToolSpec(
+                        name="text.write",
+                        description="write text",
+                        display_name="Text write",
+                        input_schema={"type": "object", "properties": {}},
+                        handler=_handler,
+                    ),
+                    ToolSpec(
+                        name="text_write",
+                        description="write text again",
+                        display_name="Text write again",
+                        input_schema={"type": "object", "properties": {}},
+                        handler=_handler,
+                    ),
+                ]
+            )
 
 
 if __name__ == "__main__":

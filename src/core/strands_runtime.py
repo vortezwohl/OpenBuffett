@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import re
 import time
 from typing import Any
 
@@ -16,6 +17,9 @@ from strands import Agent as StrandsAgent, tool
 
 from src.core.events import LoopEventSink, build_loop_event
 from src.tool.contracts import ToolContext, ToolResult, ToolSpec
+
+
+_INVALID_PROVIDER_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
 @dataclass(slots=True)
@@ -251,6 +255,7 @@ class StrandsRuntime:
             event_sink=event_sink,
         )
 
+
 def build_tool_context(
     *,
     services: dict[str, Any] | None = None,
@@ -268,6 +273,49 @@ def build_tool_context(
     )
 
 
+def sanitize_provider_tool_name(name: str) -> str:
+    """把内部工具名转换为 provider 可接受的名字。"""
+
+    sanitized = _INVALID_PROVIDER_TOOL_NAME.sub("_", name)
+    if not sanitized:
+        raise RuntimeError(f"工具名 '{name}' 无法转换为合法的 provider 工具名。")
+    return sanitized
+
+
+def build_strands_tools(
+    *,
+    tool_specs: list[ToolSpec],
+    services: dict[str, Any] | None = None,
+    llm: Any | None = None,
+    executed_tools: list[StrandsToolSummary] | None = None,
+    event_sink: LoopEventSink | None = None,
+    workspace_root: str = ".",
+) -> list[Any]:
+    """把一组项目内工具包装为 strands tools，并校验 provider 名冲突。"""
+
+    provider_names: dict[str, str] = {}
+    for tool_spec in tool_specs:
+        provider_name = sanitize_provider_tool_name(tool_spec.name)
+        existing = provider_names.get(provider_name)
+        if existing is not None and existing != tool_spec.name:
+            raise RuntimeError(
+                "不同内部工具名映射到了同一个 provider 工具名: "
+                f"'{existing}' 与 '{tool_spec.name}' -> '{provider_name}'。"
+            )
+        provider_names[provider_name] = tool_spec.name
+    return [
+        build_strands_tool(
+            tool_spec=tool_spec,
+            services=services,
+            llm=llm,
+            executed_tools=executed_tools,
+            event_sink=event_sink,
+            workspace_root=workspace_root,
+        )
+        for tool_spec in tool_specs
+    ]
+
+
 def build_strands_tool(
     *,
     tool_spec: ToolSpec,
@@ -278,6 +326,7 @@ def build_strands_tool(
     workspace_root: str = ".",
 ):
     """把一个项目内 `ToolSpec` 包装为 strands tool。"""
+    provider_tool_name = sanitize_provider_tool_name(tool_spec.name)
 
     def _call(**kwargs):
         start_time = time.perf_counter()
@@ -342,7 +391,7 @@ def build_strands_tool(
 
     return tool(
         _call,
-        name=tool_spec.name,
+        name=provider_tool_name,
         description=tool_spec.description,
         inputSchema=tool_spec.input_schema,
     )

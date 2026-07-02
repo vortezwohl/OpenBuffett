@@ -136,7 +136,7 @@ class AgentWorkbenchApp(App[None]):
         """挂载后刷新界面并开始计时。"""
 
         self._refresh_view()
-        self.set_interval(0.1, self._refresh_running_timeline)
+        self.set_interval(0.01, self._refresh_running_timeline)
         self.call_after_refresh(self._focus_chat_input)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:

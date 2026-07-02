@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.core.events import LoopEventSink
-from src.core.strands_runtime import StrandsRunResult, StrandsRuntime, build_strands_tool
+from src.core.strands_runtime import StrandsRunResult, StrandsRuntime, build_strands_tools
 from src.tool.registry import ToolRegistry
 
 
@@ -78,18 +78,16 @@ class Agent:
             raise RuntimeError(
                 "Agent requires a model when runtime.requires_model is true."
             )
+        tool_specs = self._tool_registry.list_tools(*self._tool_names)
         return self._runtime.create_session_runner(
             model=self._model,
-            tools=[
-                build_strands_tool(
-                    tool_spec=tool_spec,
-                    services=self._services,
-                    llm=self._llm,
-                    event_sink=self._event_sink,
-                    workspace_root=self._workspace_root,
-                )
-                for tool_spec in self._tool_registry.list_tools(*self._tool_names)
-            ],
+            tools=build_strands_tools(
+                tool_specs=tool_specs,
+                services=self._services,
+                llm=self._llm,
+                event_sink=self._event_sink,
+                workspace_root=self._workspace_root,
+            ),
             system_prompt=self._system_prompt,
             event_sink=self._event_sink,
         )
