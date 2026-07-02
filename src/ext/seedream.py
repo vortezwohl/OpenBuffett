@@ -6,8 +6,8 @@
 2. 向图片生成接口发起请求；
 3. 直接返回豆包接口返回的 `url` 或 `b64_json` 数据，交由上层自行消费。
 
-调用方应优先通过显式参数传入鉴权信息；若未传入，则会从常见环境变量中
-按顺序兜底读取。
+调用方默认通过 `dotenv` 加载后的环境变量提供鉴权信息；若显式传入参数，
+则显式值优先。
 """
 
 from __future__ import annotations
@@ -16,7 +16,10 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from dotenv import load_dotenv
 import requests
+
+load_dotenv()
 
 
 DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
@@ -230,9 +233,8 @@ class SeedreamClient:
     def _resolve_api_key() -> str:
         """按常见命名顺序解析 Seedream/火山方舟鉴权信息。
 
-        优先读取更具语义性的专用环境变量，避免误用项目中其他模型提供方的
-        通用 `API_KEY`。但若项目本身已经约定了统一的 `API_KEY`，则仍允许
-        作为最后兜底项使用。
+        默认读取 `dotenv` 加载后的环境变量，优先使用更具语义性的专用
+        环境变量，避免误用项目中其他模型提供方的通用 `API_KEY`。
         """
         for env_name in (
             "SEEDREAM_API_KEY",
@@ -247,7 +249,10 @@ class SeedreamClient:
 
     @staticmethod
     def _resolve_api_base() -> str:
-        """按常见命名顺序解析图片生成接口基础地址。"""
+        """按常见命名顺序解析图片生成接口基础地址。
+
+        默认读取 `dotenv` 加载后的环境变量；若未配置，则回退到默认 base。
+        """
         for env_name in (
             "SEEDREAM_API_BASE",
             "ARK_API_BASE",
@@ -281,8 +286,8 @@ def generate_seedream_image(
     Args:
         prompt: 生图提示词。
         image: 可选参考图，支持图片 URL、Data URL 或纯 Base64 图片内容。
-        api_key: 火山方舟 API Key。
-        api_base: 图片生成接口基础地址。
+        api_key: 火山方舟 API Key。为空时默认从 `dotenv` 加载后的环境变量读取。
+        api_base: 图片生成接口基础地址。为空时默认从 `dotenv` 加载后的环境变量读取。
         model: Seedream 模型名。
         size: 输出尺寸。
         n: 生成张数。
