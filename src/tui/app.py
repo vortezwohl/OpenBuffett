@@ -8,6 +8,7 @@ EasyHarness 提供，本文件不得重新定义跨 UI 共享的 runtime 或 tim
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -17,11 +18,12 @@ from rich.align import Align
 from rich.console import Group
 from rich.text import Text
 from textual import work
-from textual.app import App, ComposeResult, ScreenStackError
+from textual.app import App, ComposeResult, ScreenStackError, SystemCommand
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual import events
+from textual.screen import Screen
 from textual.worker import Worker, get_current_worker
 from textual.widgets import Footer, Header, Input, Static
 from vortezwohl.nlp import LevenshteinDistance
@@ -41,6 +43,7 @@ _COMMAND_HELP_TEXT = (
     "Available commands: /stop interrupts the active reply, /new starts a new session, /help shows this help."
 )
 _INPUT_PLACEHOLDER = "Send a message. /stop interrupts, /new resets, /help shows commands."
+_LOCKED_THEME_NAME = "ansi-dark"
 
 
 @dataclass(slots=True)
@@ -79,48 +82,66 @@ class AgentWorkbenchApp(App[None]):
     Screen {
         layout: vertical;
         color: white;
+        background: #1f1f1f;
     }
 
     Header {
         background: #123225;
         color: white;
+        width: 1fr;
     }
 
     #body {
         height: 1fr;
+        width: 1fr;
+        min-width: 0;
         padding: 0 1;
+        background: #1f1f1f;
     }
 
     #status-banner {
         height: auto;
+        width: 1fr;
+        min-width: 0;
         padding: 0 1;
         color: white;
+        background: #1f1f1f;
         border: round #d8ffe0;
     }
 
     #timeline-scroll {
         height: 1fr;
+        width: 1fr;
+        min-width: 0;
         border: round #d8ffe0;
         color: white;
         padding: 0 1;
+        background: #1f1f1f;
     }
 
     #timeline-view {
         width: 1fr;
+        min-width: 0;
         height: auto;
     }
 
     #queue-tray {
         height: auto;
+        width: 1fr;
+        min-width: 0;
         margin-top: 1;
         padding: 0 1;
         color: white;
+        background: #1f1f1f;
         border: round #effff1;
     }
 
     #chat-input {
+        width: 1fr;
+        min-width: 0;
         margin-top: 1;
         color: white;
+        background: #1f1f1f;
         border: round #effff1;
     }
     """
@@ -138,6 +159,7 @@ class AgentWorkbenchApp(App[None]):
         """
 
         super().__init__()
+        self.theme = _LOCKED_THEME_NAME
         self._agent = agent or build_default_agent()
         self._items: list[_TimelineItem] = []
         self._item_counter = 0
@@ -151,6 +173,8 @@ class AgentWorkbenchApp(App[None]):
         self._active_worker: Worker[None] | None = None
         self._stopping_turn_id: str | None = None
         self._cancelled_turn_id: str | None = None
+        self._full_repaint_scheduled = False
+        self._pending_repaint_force_follow = False
         self._command_matcher = LevenshteinDistance(ignore_case=True)
 
     def compose(self) -> ComposeResult:
@@ -171,12 +195,19 @@ class AgentWorkbenchApp(App[None]):
     def on_mount(self) -> None:
         """挂载后刷新界面并启动本地运行态计时。"""
 
-        self._refresh_view(force_follow=True)
+        self._enforce_locked_theme()
+        self._run_full_repaint(force_follow=True)
         self.set_interval(
             _TIMELINE_REFRESH_INTERVAL_SECONDS,
             self._refresh_running_items,
         )
         self.call_after_refresh(self._focus_chat_input)
+
+    def on_resize(self, event: events.Resize) -> None:
+        """在终端尺寸变化后强制按新布局重绘本地视图。"""
+
+        self._enforce_locked_theme()
+        self._schedule_full_repaint()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """把输入框内容提交给 EasyHarness agent。"""
@@ -238,6 +269,29 @@ class AgentWorkbenchApp(App[None]):
         self._cancelled_turn_id = None
         self._status_message = "Started a new session."
         self._refresh_view()
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        """移除内建主题切换命令，避免向用户暴露换肤入口。"""
+
+        for command in super().get_system_commands(screen):
+            if command.title == "Theme":
+                continue
+            yield command
+
+    def action_change_theme(self) -> None:
+        """锁定主题后忽略内建主题搜索入口。"""
+
+        self._enforce_locked_theme()
+
+    def search_themes(self) -> None:
+        """锁定主题后禁止打开主题切换面板。"""
+
+        self._enforce_locked_theme()
+
+    def action_toggle_dark(self) -> None:
+        """锁定主题后忽略明暗主题切换动作。"""
+
+        self._enforce_locked_theme()
 
     @work(thread=True, group="agent", exit_on_error=False)
     def _run_turn_worker(self, turn_id: str, prompt: str) -> None:
@@ -514,6 +568,33 @@ class AgentWorkbenchApp(App[None]):
             body=content,
             metadata=metadata,
         )
+
+    def _enforce_locked_theme(self) -> None:
+        """把应用主题收口到唯一允许的 ansi-dark。"""
+
+        if self.theme != _LOCKED_THEME_NAME:
+            self.theme = _LOCKED_THEME_NAME
+
+    def _schedule_full_repaint(self, *, force_follow: bool = False) -> None:
+        """在当前 refresh 周期稳定后统一执行完整 repaint。"""
+
+        self._pending_repaint_force_follow = (
+            self._pending_repaint_force_follow or force_follow
+        )
+        if self._full_repaint_scheduled:
+            return
+        self._full_repaint_scheduled = True
+        self.call_after_refresh(self._run_full_repaint)
+
+    def _run_full_repaint(self, *, force_follow: bool | None = None) -> None:
+        """执行 mount 与 resize 共用的完整布局和视图刷新。"""
+
+        if force_follow is None:
+            force_follow = self._pending_repaint_force_follow
+        self._pending_repaint_force_follow = False
+        self._full_repaint_scheduled = False
+        self.refresh(layout=True, repaint=True)
+        self._refresh_view(force_follow=force_follow)
 
     def _start_local_thinking(self) -> None:
         """在收到真实事件前先启动本地 thinking 占位与计时。"""
