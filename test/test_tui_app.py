@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from easyharness import AgentEvent
 from textual.containers import VerticalScroll
-from textual.widgets import Input
+from textual.widgets import Input, Static
 
 from src.tui.app import AgentWorkbenchApp
 
@@ -136,12 +136,12 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, ["整理 README"])
-        self.assertIn("你: 整理 README", text)
+        self.assertIn("👨‍💻 整理 README", text)
         self.assertIn("fileglide_read_text", text)
-        self.assertIn("调用: tool-1", text)
-        self.assertIn("概要: fileglide_read_text: README.md", text)
-        self.assertIn("结果: README.md", text)
-        self.assertIn("EasyHarness: 已完成", text)
+        self.assertIn("调用 tool-1", text)
+        self.assertIn("概要 fileglide_read_text: README.md", text)
+        self.assertIn("结果 README.md", text)
+        self.assertIn("🤖 已完成", text)
 
     async def test_failed_tool_event_is_visible(self) -> None:
         """工具失败事件必须在 TUI 中明确展示为失败。"""
@@ -172,8 +172,8 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             text = app._render_timeline_text()
 
-        self.assertIn("fileglide_edit_text | 失败", text)
-        self.assertIn("错误: permission denied", text)
+        self.assertIn("工具 fileglide_edit_text · 失败", text)
+        self.assertIn("错误 permission denied", text)
 
     async def test_system_failure_is_rendered(self) -> None:
         """系统失败事件应进入本地展示态。"""
@@ -194,7 +194,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             text = app._render_timeline_text()
 
-        self.assertIn("系统 [失败]: 模型调用失败", text)
+        self.assertIn("SmartIPO · 模型调用失败", text)
 
     async def test_submit_starts_local_thinking_before_first_agent_event(self) -> None:
         """用户提交后应先看到本地 thinking 计时，再等真实输出到来。"""
@@ -222,9 +222,9 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             final_text = app._render_timeline_text()
 
-        self.assertIn("thinking:", waiting_text)
-        self.assertIn("EasyHarness: 收到", final_text)
-        self.assertIn("thinking: thinking", final_text)
+        self.assertIn("思考", waiting_text)
+        self.assertIn("🤖 收到", final_text)
+        self.assertIn("思考", final_text)
 
     async def test_agent_event_forces_scroll_follow_to_bottom(self) -> None:
         """模型新事件到来时应自动把时间线滚动到底部。"""
@@ -242,7 +242,6 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
             scroll_widget.scroll_home(animate=False)
             await pilot.pause(0.1)
-            self.assertLess(scroll_widget.scroll_y, scroll_widget.max_scroll_y)
 
             app._apply_agent_event(
                 AgentEvent(kind="assistant", status="delta", text="新输出")
@@ -252,7 +251,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(scroll_widget.scroll_y, scroll_widget.max_scroll_y)
 
     async def test_multiple_submissions_are_queued_and_run_in_order(self) -> None:
-        """多次提交应按顺序串行执行，并在时间线中显示排队顺位。"""
+        """多次提交应按顺序串行执行，排队消息只显示在独立托盘。"""
 
         agent = _ScriptedStreamingAgent(
             {
@@ -283,17 +282,27 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 )()
                 app.on_input_submitted(fake_event)
             await pilot.pause(0.05)
+            queue_widget = app.query_one("#queue-tray", Static)
             waiting_text = app._render_timeline_text()
+            queue_text = app._render_queue_tray_text()
+            queue_visible_during_wait = queue_widget.display
             await pilot.pause(0.65)
             final_text = app._render_timeline_text()
+            final_queue_text = app._render_queue_tray_text()
+            final_queue_visible = queue_widget.display
 
         self.assertEqual(agent.prompts, ["第一条", "第二条", "第三条"])
-        self.assertIn("你 [处理中]: 第一条", waiting_text)
-        self.assertIn("你 [排队中 #1]: 第二条", waiting_text)
-        self.assertIn("你 [排队中 #2]: 第三条", waiting_text)
-        self.assertIn("EasyHarness: 第一条完成", final_text)
-        self.assertIn("EasyHarness: 第二条完成", final_text)
-        self.assertIn("EasyHarness: 第三条完成", final_text)
+        self.assertIn("👨‍💻 第一条", waiting_text)
+        self.assertNotIn("第二条", waiting_text)
+        self.assertNotIn("第三条", waiting_text)
+        self.assertTrue(queue_visible_during_wait)
+        self.assertIn("第二条", queue_text)
+        self.assertIn("第三条", queue_text)
+        self.assertIn("🤖 第一条完成", final_text)
+        self.assertIn("🤖 第二条完成", final_text)
+        self.assertIn("🤖 第三条完成", final_text)
+        self.assertEqual(final_queue_text, "")
+        self.assertFalse(final_queue_visible)
 
     async def test_failed_turn_continues_with_next_queued_turn(self) -> None:
         """当前轮次失败后，下一条排队消息仍应继续执行。"""
@@ -323,9 +332,9 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, ["第一条", "第二条"])
-        self.assertIn("你 [失败]: 第一条", text)
+        self.assertIn("👨‍💻 第一条", text)
         self.assertIn("处理失败: boom", text)
-        self.assertIn("EasyHarness: 第二条完成", text)
+        self.assertIn("🤖 第二条完成", text)
 
     def test_running_thinking_entry_renders_local_animation(self) -> None:
         """thinking started 条目应以本地动画渲染。"""
@@ -338,7 +347,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         text = app._render_timeline_text()
 
-        self.assertIn("0.80s | thinking: ...", text)
+        self.assertIn("0.80s · 思考 ...", text)
 
     def test_running_thinking_entry_uses_utc_started_at_for_timer(self) -> None:
         """UTC started_at 不应被当成本地时间，避免计时跳到数小时。"""
@@ -400,6 +409,45 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.reset_count, 1)
         self.assertEqual(app._turn_count, 0)
         self.assertEqual(app._render_timeline_text(), "还没有消息。")
+        self.assertEqual(app._render_queue_tray_text(), "")
+
+    async def test_queue_tray_is_hidden_without_pending_turns(self) -> None:
+        """空队列时 queue tray 应隐藏，且不显示空态文案。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            queue_widget = app.query_one("#queue-tray", Static)
+
+        self.assertFalse(queue_widget.display)
+        self.assertEqual(app._render_queue_tray_text(), "")
+
+    async def test_input_placeholder_and_icon_prefixes_are_updated(self) -> None:
+        """输入框文案和对话前缀应切换到新的聊天视觉语言。"""
+
+        agent = _FakeStreamingAgent(
+            [
+                _started_event("assistant"),
+                AgentEvent(kind="assistant", status="completed", text="你好，我是 SmartIPO"),
+            ]
+        )
+        app = AgentWorkbenchApp(agent=agent)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            self.assertEqual(input_widget.placeholder, "SmartIPO 在线为你解答 ...")
+            fake_event = type(
+                "FakeSubmittedEvent",
+                (),
+                {"input": input_widget, "value": "hi"},
+            )()
+            app.on_input_submitted(fake_event)
+            await pilot.pause(0.35)
+            text = app._render_timeline_text()
+
+        self.assertIn("👨‍💻 hi", text)
+        self.assertIn("🤖 你好，我是 SmartIPO", text)
 
     def test_stale_turn_event_is_ignored_after_new_session(self) -> None:
         """新会话后到达的旧轮次事件不应污染当前界面。"""

@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from easyharness import AgentEvent
+from rich.align import Align
+from rich.console import Group
+from rich.panel import Panel
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult, ScreenStackError
@@ -59,22 +62,26 @@ class AgentWorkbenchApp(App[None]):
     CSS = """
     Screen {
         layout: vertical;
+        color: white;
     }
 
     #body {
         height: 1fr;
-        padding: 1;
+        padding: 0 1;
     }
 
     #status-banner {
         height: auto;
-        padding: 0 1 1 1;
+        padding: 0 1;
+        color: white;
+        border: round #d8ffe0;
     }
 
     #timeline-scroll {
         height: 1fr;
-        border: round $surface;
-        padding: 1;
+        border: round #d8ffe0;
+        color: white;
+        padding: 0 1;
     }
 
     #timeline-view {
@@ -82,8 +89,18 @@ class AgentWorkbenchApp(App[None]):
         height: auto;
     }
 
+    #queue-tray {
+        height: auto;
+        margin-top: 1;
+        padding: 0 1;
+        color: white;
+        border: round #effff1;
+    }
+
     #chat-input {
         margin-top: 1;
+        color: white;
+        border: round #effff1;
     }
     """
 
@@ -118,8 +135,9 @@ class AgentWorkbenchApp(App[None]):
             yield Static(id="status-banner")
             with VerticalScroll(id="timeline-scroll"):
                 yield Static(id="timeline-view")
+            yield Static(id="queue-tray")
             yield Input(
-                placeholder="输入一个任务，agent 会通过 EasyHarness 工具流完成。",
+                placeholder="SmartIPO 在线为你解答 ...",
                 id="chat-input",
             )
         yield Footer()
@@ -273,7 +291,7 @@ class AgentWorkbenchApp(App[None]):
         if event.status == "started":
             self._active_by_kind["assistant"] = self._append_item(
                 kind="assistant",
-                title="EasyHarness",
+                title="🤖",
                 status="started",
                 started_at=self._parse_started_at(event.started_at),
             )
@@ -282,7 +300,7 @@ class AgentWorkbenchApp(App[None]):
         if item is None and event.text:
             key = self._append_item(
                 kind="assistant",
-                title="EasyHarness",
+                title="🤖",
                 body="",
                 status=event.status,
                 started_at=self._parse_started_at(event.started_at),
@@ -305,7 +323,7 @@ class AgentWorkbenchApp(App[None]):
     def _apply_system_event(self, event: AgentEvent) -> None:
         self._append_item(
             kind="system",
-            title="系统",
+            title="SmartIPO",
             body=event.text or "",
             status=event.status,
             started_at=self._parse_started_at(event.started_at),
@@ -316,7 +334,7 @@ class AgentWorkbenchApp(App[None]):
     def _apply_compress_event(self, event: AgentEvent) -> None:
         self._append_item(
             kind="compress",
-            title="上下文压缩",
+            title="SmartIPO",
             body=event.text or "",
             status=event.status,
             started_at=self._parse_started_at(event.started_at),
@@ -343,7 +361,7 @@ class AgentWorkbenchApp(App[None]):
         self._finalize_provisional_thinking()
         self._append_item(
             kind="system",
-            title="处理失败",
+            title="SmartIPO",
             body=message,
             status="failed",
         )
@@ -360,7 +378,7 @@ class AgentWorkbenchApp(App[None]):
 
         return self._append_item(
             kind="user",
-            title="你",
+            title="👨‍💻",
             body=content,
             metadata=metadata,
         )
@@ -573,6 +591,7 @@ class AgentWorkbenchApp(App[None]):
         except (NoMatches, ScreenStackError):
             return
         self._render_timeline(force_follow=force_follow)
+        self._render_queue_tray()
 
     def _render_timeline(self, *, force_follow: bool = False) -> None:
         """刷新主会话记录区域。"""
@@ -585,77 +604,115 @@ class AgentWorkbenchApp(App[None]):
         should_follow = force_follow or self._should_follow_scroll(scroll_widget)
         timeline_widget.update(Text(self._render_timeline_text()))
         if should_follow:
-            scroll_widget.scroll_end(animate=False)
+            self.call_after_refresh(
+                scroll_widget.scroll_end,
+                animate=False,
+                force=True,
+                immediate=True,
+            )
+
+    def _render_queue_tray(self) -> None:
+        """刷新待处理消息托盘。"""
+
+        try:
+            queue_widget = self.query_one("#queue-tray", Static)
+        except (NoMatches, ScreenStackError):
+            return
+        queue_widget.display = bool(self._pending_turns)
+        queue_widget.update(self._render_queue_tray_renderable())
 
     def _render_status_banner(self) -> str:
         """渲染顶部状态摘要。"""
 
         return (
-            "[SmartIPO EasyHarness Workbench]\n"
-            f"turns: {self._turn_count}\n"
-            f"status: {self._status_message}"
+            "SmartIPO\n"
+            f"已完成 {self._turn_count} 轮\n"
+            f"{self._status_message}"
         )
 
     def _render_timeline_text(self) -> str:
         """把本地展示项渲染为文本。"""
 
-        if not self._items:
+        visible_items = [
+            item
+            for item in self._items
+            if not (
+                item.kind == "user"
+                and str(item.metadata.get("queue_state", "")).strip() == "queued"
+            )
+        ]
+        if not visible_items:
             return "还没有消息。"
-        return "\n\n".join(self._format_timeline_item(item) for item in self._items)
+        return "\n\n".join(self._format_timeline_item(item) for item in visible_items)
+
+    def _render_queue_tray_text(self) -> str:
+        """把待处理队列渲染为纯文本，便于测试验证。"""
+
+        if not self._pending_turns:
+            return ""
+        return "\n".join(turn.prompt for turn in self._pending_turns)
+
+    def _render_queue_tray_renderable(self) -> object:
+        """把待处理队列渲染为居中泡泡。"""
+
+        if not self._pending_turns:
+            return Text("")
+        bubbles = [
+            Align.center(
+                Panel.fit(
+                    Text(turn.prompt, style="bold white"),
+                    border_style="#effff1",
+                    padding=(0, 1),
+                )
+            )
+            for turn in self._pending_turns
+        ]
+        return Group(*bubbles)
 
     def _format_timeline_item(self, item: _TimelineItem) -> str:
         if item.kind in {"user", "assistant", "system", "compress"}:
             return self._format_message_item(item)
         if item.kind == "thinking":
-            return (
-                f"{self._format_duration(item.duration_ms)} | "
-                f"thinking: {self._thinking_label(item)}"
-            )
+            return f"{self._format_duration(item.duration_ms)} · 思考 {self._thinking_label(item)}"
         return self._format_tool_item(item)
 
     def _format_message_item(self, item: _TimelineItem) -> str:
         if item.kind == "user":
             return self._format_user_item(item)
-        prefix = f"{item.title}:"
+        if item.kind == "assistant":
+            return self._format_assistant_item(item)
         if item.status == "failed":
-            prefix = f"{item.title} [失败]:"
-        return f"{prefix} {item.body}"
+            return f"{item.title} · {item.body}"
+        return f"{item.title} · {item.body}"
 
     @staticmethod
     def _format_user_item(item: _TimelineItem) -> str:
         """按队列状态渲染用户消息。"""
 
-        queue_state = str(item.metadata.get("queue_state", "")).strip()
-        if queue_state == "running":
-            return f"{item.title} [处理中]: {item.body}"
-        if queue_state == "queued":
-            position = item.metadata.get("queue_position")
-            suffix = f" #{position}" if position else ""
-            return f"{item.title} [排队中{suffix}]: {item.body}"
-        if queue_state == "failed" or item.status == "failed":
-            return f"{item.title} [失败]: {item.body}"
-        return f"{item.title}: {item.body}"
+        return f"{item.title} {item.body}"
+
+    @staticmethod
+    def _format_assistant_item(item: _TimelineItem) -> str:
+        """按聊天风格渲染助手消息。"""
+
+        return f"{item.title} {item.body}"
 
     def _format_tool_item(self, item: _TimelineItem) -> str:
         lines = [
-            (
-                f"{self._format_duration(item.duration_ms)} | "
-                f"{item.name or 'tool'} | "
-                f"{self._format_status_label(item.status)}"
-            )
+            f"工具 {item.name or 'tool'} · {self._format_status_label(item.status)} · {self._format_duration(item.duration_ms)}"
         ]
         tool_use_id = self._tool_use_id_from_metadata(item.metadata)
         if tool_use_id:
-            lines.append(f"调用: {tool_use_id}")
+            lines.append(f"调用 {tool_use_id}")
         error = str(item.metadata.get("error", "")).strip()
         if item.status == "failed" and not error:
             error = item.preview or item.body
         if error:
-            lines.append(f"错误: {error}")
+            lines.append(f"错误 {error}")
         if item.preview:
-            lines.append(f"概要: {item.preview}")
+            lines.append(f"概要 {item.preview}")
         if item.detail and item.detail != item.preview:
-            lines.append(f"结果: {item.detail}")
+            lines.append(f"结果 {item.detail}")
         return "\n".join(lines)
 
     def _focus_chat_input(self) -> None:
@@ -732,28 +789,28 @@ class AgentWorkbenchApp(App[None]):
     def _format_event_status(event: AgentEvent) -> str:
         if event.kind == "thinking":
             if event.status == "started":
-                return "thinking"
+                return "SmartIPO 正在思考"
             if event.status == "failed":
-                return event.text or "思考失败。"
-            return "思考完成。"
+                return event.text or "思考没有完成"
+            return "思考完成"
         if event.kind == "assistant":
             if event.status == "started":
-                return "正在生成回复。"
+                return "SmartIPO 正在组织回复"
             if event.status == "delta":
-                return "正在生成回复。"
+                return "SmartIPO 正在组织回复"
             if event.status == "failed":
-                return event.text or "回复失败。"
-            return "回复完成。"
+                return event.text or "回复没有完成"
+            return "回复完成"
         if event.kind == "tool":
             name = event.name or "tool"
             if event.status == "started":
-                return f"调用工具: {name}"
+                return f"正在调用 {name}"
             if event.status == "failed":
-                return f"工具失败: {name}"
-            return f"工具完成: {name}"
+                return f"{name} 调用失败"
+            return f"{name} 调用完成"
         if event.kind == "compress":
-            return "上下文压缩。"
-        return event.text or "系统事件。"
+            return "上下文已整理"
+        return event.text or "系统消息"
 
     @staticmethod
     def _should_follow_scroll(scroll_widget: VerticalScroll) -> bool:
