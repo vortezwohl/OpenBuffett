@@ -42,7 +42,8 @@ class EasyHarnessToolingTests(unittest.TestCase):
             DEFAULT_WORKBENCH_TOOL_NAMES,
             (*DEFAULT_FILEGLIDE_TOOL_NAMES, *DEFAULT_BUSINESS_TOOL_NAMES),
         )
-        self.assertIn("EasyHarness", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("美股 IPO 研究", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("中签率", DEFAULT_SYSTEM_PROMPT)
         self.assertNotIn("text.read", DEFAULT_SYSTEM_PROMPT)
 
     def test_build_default_tools_returns_public_tool_objects(self) -> None:
