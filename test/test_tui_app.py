@@ -87,6 +87,57 @@ class _ScriptedStreamingAgent:
         self.reset_count += 1
 
 
+class _RuntimeCancelableAgent:
+    """模拟支持 runtime cancel 的 EasyHarness agent。"""
+
+    def __init__(
+        self,
+        scripts: dict[str, list[AgentEvent]],
+        *,
+        cancelled_scripts: dict[str, list[AgentEvent]] | None = None,
+        tail_scripts: dict[str, list[AgentEvent]] | None = None,
+        wait_timeout_seconds: float = 1.0,
+    ) -> None:
+        self.scripts = scripts
+        self.cancelled_scripts = cancelled_scripts or {}
+        self.tail_scripts = tail_scripts or {}
+        self.wait_timeout_seconds = wait_timeout_seconds
+        self.prompts: list[str] = []
+        self.cancel_count = 0
+        self.reset_count = 0
+        self._cancel_requested = False
+
+    def stream(self, prompt: str):
+        """先输出前置脚本；若该 prompt 支持取消，则等待 cancel 后再输出 cancelled 终态。"""
+
+        self.prompts.append(prompt)
+        for event in self.scripts.get(prompt, []):
+            yield event
+
+        cancelled_script = self.cancelled_scripts.get(prompt)
+        if cancelled_script is not None:
+            deadline = time.time() + self.wait_timeout_seconds
+            while not self._cancel_requested and time.time() < deadline:
+                time.sleep(0.01)
+            if self._cancel_requested:
+                yield from cancelled_script
+                self._cancel_requested = False
+                return
+
+        yield from self.tail_scripts.get(prompt, [])
+
+    def cancel(self) -> None:
+        """记录取消并唤醒等待中的流。"""
+
+        self.cancel_count += 1
+        self._cancel_requested = True
+
+    def reset(self) -> None:
+        """记录重置次数。"""
+
+        self.reset_count += 1
+
+
 def _started_event(kind: str, *, name: str | None = None) -> AgentEvent:
     """构造 started 阶段测试事件。"""
 
@@ -524,36 +575,199 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(input_widget.value, "/stop")
 
     async def test_stop_command_preserves_partial_assistant_reply(self) -> None:
-        """/stop 应保留已生成的半截 assistant 回复，并收口当前 turn。"""
+        """/stop 应调用 runtime cancel，保留半截 assistant，并留下 stopped 事件。"""
 
-        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
-        app._enqueue_turn("分析一下")
-        app._active_turn = app._pending_turns.popleft()
-        app._refresh_turn_queue_metadata()
-        assistant_key = app._append_item(
-            kind="assistant",
-            title="Assistant > ",
-            body="这是半句",
-            status="started",
-            started_at=datetime.now(timezone.utc),
+        agent = _RuntimeCancelableAgent(
+            {
+                "分析一下": [
+                    _started_event("assistant"),
+                    AgentEvent(kind="assistant", status="delta", text="这是半句"),
+                ]
+            },
+            cancelled_scripts={
+                "分析一下": [
+                    AgentEvent(
+                        kind="assistant",
+                        status="cancelled",
+                        text="这是半句",
+                        duration_ms=10,
+                    ),
+                    AgentEvent(
+                        kind="system",
+                        status="cancelled",
+                        text="这是半句",
+                        data={"stop_reason": "cancelled"},
+                    ),
+                ]
+            },
         )
-        app._active_by_kind["assistant"] = assistant_key
+        app = AgentWorkbenchApp(agent=agent)
 
         async with app.run_test() as pilot:
             input_widget = app.query_one("#chat-input", Input)
+            submit_event = type(
+                "FakeSubmittedEvent",
+                (),
+                {"input": input_widget, "value": "分析一下"},
+            )()
+            app.on_input_submitted(submit_event)
+            await pilot.pause(0.1)
             fake_event = type(
                 "FakeSubmittedEvent",
                 (),
                 {"input": input_widget, "value": "/stop"},
             )()
             app.on_input_submitted(fake_event)
-            await pilot.pause(0.1)
+            await pilot.pause(0.25)
             text = app._render_timeline_text()
 
         self.assertIn("Assistant > 这是半句", text)
-        self.assertIn("SmartIPO · Interrupted the active reply.", text)
+        self.assertIn("SmartIPO · Reply stopped.", text)
+        self.assertEqual(agent.cancel_count, 1)
         self.assertIsNone(app._active_turn)
         self.assertEqual(app._turn_count, 1)
+
+    async def test_stop_command_settles_cancelled_tool_without_marking_failure(self) -> None:
+        """/stop 收到 cancelled tool 终态后，应显示 stopped 而不是 failed。"""
+
+        agent = _RuntimeCancelableAgent(
+            {
+                "调用工具": [
+                    AgentEvent(
+                        kind="tool",
+                        status="started",
+                        name="fileglide_read_text",
+                        data={"tool_use_id": "tool-1"},
+                    )
+                ]
+            },
+            cancelled_scripts={
+                "调用工具": [
+                    AgentEvent(
+                        kind="tool",
+                        status="cancelled",
+                        name="fileglide_read_text",
+                        duration_ms=8,
+                        data={"tool_use_id": "tool-1"},
+                    ),
+                    AgentEvent(
+                        kind="system",
+                        status="cancelled",
+                        data={"stop_reason": "cancelled"},
+                    ),
+                ]
+            },
+        )
+        app = AgentWorkbenchApp(agent=agent)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            app.on_input_submitted(
+                type(
+                    "FakeSubmittedEvent",
+                    (),
+                    {"input": input_widget, "value": "调用工具"},
+                )()
+            )
+            await pilot.pause(0.1)
+            app.on_input_submitted(
+                type(
+                    "FakeSubmittedEvent",
+                    (),
+                    {"input": input_widget, "value": "/stop"},
+                )()
+            )
+            await pilot.pause(0.25)
+            text = app._render_timeline_text()
+
+        self.assertIn("0.01s · { Tool fileglide_read_text · Stopped }", text)
+        self.assertNotIn("Failed", text)
+        self.assertIn("SmartIPO · Reply stopped.", text)
+
+    async def test_cancelled_turn_ignores_late_events_and_continues_queue(self) -> None:
+        """取消收口后，旧 turn 迟到事件不应污染后续排队 turn。"""
+
+        agent = _RuntimeCancelableAgent(
+            {
+                "第一条": [
+                    _started_event("assistant"),
+                    AgentEvent(kind="assistant", status="delta", text="第一条半句"),
+                ],
+                "第二条": [_started_event("assistant")],
+            },
+            cancelled_scripts={
+                "第一条": [
+                    AgentEvent(
+                        kind="assistant",
+                        status="cancelled",
+                        text="第一条半句",
+                        duration_ms=10,
+                    ),
+                    AgentEvent(
+                        kind="system",
+                        status="cancelled",
+                        data={"stop_reason": "cancelled"},
+                    ),
+                ]
+            },
+            tail_scripts={
+                "第二条": [
+                    AgentEvent(kind="assistant", status="completed", text="第二条完成"),
+                ]
+            },
+        )
+        app = AgentWorkbenchApp(agent=agent)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            for prompt in ("第一条", "第二条"):
+                app.on_input_submitted(
+                    type(
+                        "FakeSubmittedEvent",
+                        (),
+                        {"input": input_widget, "value": prompt},
+                    )()
+                )
+            await pilot.pause(0.1)
+            stopped_turn_id = app._active_turn.turn_id  # type: ignore[union-attr]
+            app.on_input_submitted(
+                type(
+                    "FakeSubmittedEvent",
+                    (),
+                    {"input": input_widget, "value": "/stop"},
+                )()
+            )
+            await pilot.pause(0.45)
+
+        app._apply_agent_event_for_turn(
+            stopped_turn_id,
+            AgentEvent(kind="assistant", status="delta", text="旧输出"),
+        )
+        text = app._render_timeline_text()
+
+        self.assertEqual(agent.prompts, ["第一条", "第二条"])
+        self.assertIn("SmartIPO · Reply stopped.", text)
+        self.assertIn("Assistant > 第二条完成", text)
+        self.assertNotIn("旧输出", text)
+
+    async def test_stop_command_without_active_reply_reports_noop(self) -> None:
+        """/stop 在空闲状态下应提示无活跃回复。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            app.on_input_submitted(
+                type(
+                    "FakeSubmittedEvent",
+                    (),
+                    {"input": input_widget, "value": "/stop"},
+                )()
+            )
+            await pilot.pause(0.1)
+            text = app._render_timeline_text()
+
+        self.assertIn("SmartIPO · There is no active reply to interrupt.", text)
 
     async def test_new_command_resets_session_and_ignores_old_turn_events(self) -> None:
         """/new 应重置本地会话，并继续忽略旧 turn 的迟到事件。"""
@@ -600,6 +814,81 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(app._render_timeline_text(), "No messages yet.")
+
+    async def test_failed_tool_hides_traceback_but_keeps_internal_detail(self) -> None:
+        """工具失败时主 timeline 不应直接展示 traceback，但内部 detail 仍应保留。"""
+
+        traceback_text = "Traceback (most recent call last):\n  ...\nValueError: boom"
+        agent = _FakeStreamingAgent(
+            [
+                AgentEvent(
+                    kind="tool",
+                    status="started",
+                    name="fileglide_edit_text",
+                    data={"tool_use_id": "tool-2"},
+                ),
+                AgentEvent(
+                    kind="tool",
+                    status="failed",
+                    name="fileglide_edit_text",
+                    duration_ms=3,
+                    text="boom",
+                    data={
+                        "tool_use_id": "tool-2",
+                        "error": "boom",
+                        "output": {
+                            "preview": "Error: boom",
+                            "detail": traceback_text,
+                            "model_text": "Error: boom",
+                        },
+                    },
+                ),
+            ]
+        )
+        app = AgentWorkbenchApp(agent=agent)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            app.on_input_submitted(
+                type(
+                    "FakeSubmittedEvent",
+                    (),
+                    {"input": input_widget, "value": "写文件"},
+                )()
+            )
+            await pilot.pause(0.35)
+            text = app._render_timeline_text()
+
+        tool_item = [item for item in app._items if item.kind == "tool"][-1]
+        self.assertIn("Error boom", text)
+        self.assertNotIn("Traceback (most recent call last):", text)
+        self.assertEqual(tool_item.detail, traceback_text)
+
+    async def test_failed_system_message_is_summarized_but_raw_text_is_retained(self) -> None:
+        """系统失败消息应做摘要展示，同时保留原始异常文本。"""
+
+        traceback_text = "Traceback (most recent call last):\n  ...\nRuntimeError: boom"
+        agent = _FakeStreamingAgent(
+            [AgentEvent(kind="system", status="failed", text=traceback_text)]
+        )
+        app = AgentWorkbenchApp(agent=agent)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            app.on_input_submitted(
+                type(
+                    "FakeSubmittedEvent",
+                    (),
+                    {"input": input_widget, "value": "你好"},
+                )()
+            )
+            await pilot.pause(0.35)
+            text = app._render_timeline_text()
+
+        system_item = next(item for item in app._items if item.kind == "system")
+        self.assertIn("SmartIPO · RuntimeError: boom", text)
+        self.assertNotIn("Traceback (most recent call last):", text)
+        self.assertEqual(system_item.metadata.get("raw_text"), traceback_text)
 
 
 if __name__ == "__main__":

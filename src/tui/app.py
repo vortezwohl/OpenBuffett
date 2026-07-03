@@ -32,6 +32,7 @@ _TIMELINE_REFRESH_INTERVAL_SECONDS = 0.05
 _CHAT_PREFIX_STYLE = "bold #d8ffe0"
 _TIMING_STYLE = "#7e9b84"
 _THINKING_STYLE = "bold #88ad8f"
+_LOW_EMPHASIS_STYLE = _THINKING_STYLE
 _TOOL_BLOCK_STYLE = "bold #d8ffe0"
 _SUPPORTED_COMMANDS = ("/stop", "/new", "/help")
 _COMMAND_HELP_TEXT = (
@@ -146,6 +147,8 @@ class AgentWorkbenchApp(App[None]):
         self._pending_turns: deque[_PendingTurn] = deque()
         self._active_turn: _PendingTurn | None = None
         self._active_worker: Worker[None] | None = None
+        self._stopping_turn_id: str | None = None
+        self._cancelled_turn_id: str | None = None
         self._command_matcher = LevenshteinDistance(ignore_case=True)
 
     def compose(self) -> ComposeResult:
@@ -216,6 +219,7 @@ class AgentWorkbenchApp(App[None]):
     def action_new_session(self) -> None:
         """清空界面并重置当前 EasyHarness 会话。"""
 
+        self._request_runtime_cancel()
         self._cancel_active_worker()
         reset = getattr(self._agent, "reset", None)
         if callable(reset):
@@ -228,6 +232,8 @@ class AgentWorkbenchApp(App[None]):
         self._pending_turns.clear()
         self._active_turn = None
         self._active_worker = None
+        self._stopping_turn_id = None
+        self._cancelled_turn_id = None
         self._status_message = "Started a new session."
         self._refresh_view()
 
@@ -257,6 +263,8 @@ class AgentWorkbenchApp(App[None]):
     def _apply_agent_event(self, event: AgentEvent) -> None:
         """把 EasyHarness 事件应用到 TUI 本地展示态。"""
 
+        if event.status == "cancelled":
+            self._mark_active_turn_cancelled()
         if event.kind == "thinking":
             self._apply_thinking_event(event)
         elif event.kind == "tool":
@@ -296,7 +304,7 @@ class AgentWorkbenchApp(App[None]):
             item.metadata["provisional"] = False
             item.metadata["ephemeral"] = True
             return
-        if event.status in {"completed", "failed"}:
+        if event.status in {"completed", "failed", "cancelled"}:
             self._sync_running_item_duration(item)
             item.status = event.status
             item.duration_ms = max(item.duration_ms, event.duration_ms or 0)
@@ -340,11 +348,11 @@ class AgentWorkbenchApp(App[None]):
         item.detail = output.get("detail") or output.get("model_text") or item.detail
         if event.text and not item.preview:
             item.preview = event.text
-        if event.status in {"completed", "failed"}:
+        if event.status in {"completed", "failed", "cancelled"}:
             self._active_tools.pop(tool_key, None)
 
     def _apply_assistant_event(self, event: AgentEvent) -> None:
-        if event.status in {"started", "delta", "completed"}:
+        if event.status in {"started", "delta", "completed", "cancelled"}:
             self._remove_ephemeral_thinking_items()
         if event.status == "started":
             self._active_by_kind["assistant"] = self._append_item(
@@ -370,8 +378,8 @@ class AgentWorkbenchApp(App[None]):
         if event.status == "delta" and event.text:
             item.body += event.text
             return
-        if event.status in {"completed", "failed"}:
-            if event.text:
+        if event.status in {"completed", "failed", "cancelled"}:
+            if event.text and (event.status != "cancelled" or not item.body):
                 item.body = event.text
             item.status = event.status
             item.duration_ms = event.duration_ms or item.duration_ms
@@ -379,14 +387,22 @@ class AgentWorkbenchApp(App[None]):
             self._active_by_kind.pop("assistant", None)
 
     def _apply_system_event(self, event: AgentEvent) -> None:
+        body = event.text or ""
+        metadata = self._event_data_dict(event)
+        if event.status == "cancelled":
+            body = "Interrupted."
+            metadata["raw_text"] = event.text or ""
+        elif event.status == "failed":
+            metadata["raw_text"] = body
+            body = self._summarize_error_text(body)
         self._append_item(
             kind="system",
             title="SmartIPO",
-            body=event.text or "",
+            body=body,
             status=event.status,
             started_at=self._parse_started_at(event.started_at),
             duration_ms=event.duration_ms or 0,
-            metadata=self._event_data_dict(event),
+            metadata=metadata,
         )
 
     def _apply_compress_event(self, event: AgentEvent) -> None:
@@ -405,6 +421,15 @@ class AgentWorkbenchApp(App[None]):
 
         if not self._is_active_turn(turn_id):
             return
+        if self._is_cancelled_turn(turn_id):
+            self._settle_running_turn_items("cancelled")
+            self._remove_thinking_items()
+            self._turn_count += 1
+            self._finish_active_turn(
+                queue_state="interrupted",
+                status_message="Interrupted.",
+            )
+            return
         self._settle_running_turn_items("completed")
         self._remove_thinking_items()
         self._turn_count += 1
@@ -420,11 +445,15 @@ class AgentWorkbenchApp(App[None]):
         self._append_item(
             kind="system",
             title="SmartIPO",
-            body=message,
+            body=self._summarize_error_text(message),
             status="failed",
+            metadata={"raw_text": message},
         )
         self._turn_count += 1
-        self._finish_active_turn(queue_state="failed", status_message=message)
+        self._finish_active_turn(
+            queue_state="failed",
+            status_message=self._summarize_error_text(message),
+        )
 
     def _append_user_message(
         self,
@@ -498,6 +527,8 @@ class AgentWorkbenchApp(App[None]):
             return
         turn = self._pending_turns.popleft()
         self._active_turn = turn
+        self._stopping_turn_id = None
+        self._cancelled_turn_id = None
         self._refresh_turn_queue_metadata()
         self._start_local_thinking()
         self._status_message = "Processing queued message."
@@ -516,6 +547,8 @@ class AgentWorkbenchApp(App[None]):
             item.metadata["queue_position"] = None
             item.status = "failed" if queue_state == "failed" else "completed"
         self._active_turn = None
+        self._stopping_turn_id = None
+        self._cancelled_turn_id = None
         self._refresh_turn_queue_metadata()
         self._status_message = status_message
         self._refresh_view(force_follow=True)
@@ -563,6 +596,18 @@ class AgentWorkbenchApp(App[None]):
         """判断某个 turn_id 是否仍对应当前活跃轮次。"""
 
         return self._active_turn is not None and self._active_turn.turn_id == turn_id
+
+    def _is_cancelled_turn(self, turn_id: str) -> bool:
+        """判断当前 turn 是否已经收到 runtime cancelled 终态。"""
+
+        return self._cancelled_turn_id == turn_id
+
+    def _mark_active_turn_cancelled(self) -> None:
+        """记录当前活跃 turn 已进入 cancelled 终态。"""
+
+        if self._active_turn is None:
+            return
+        self._cancelled_turn_id = self._active_turn.turn_id
 
     def _next_turn_id(self) -> str:
         """生成当前会话内唯一的轮次编号。"""
@@ -679,6 +724,13 @@ class AgentWorkbenchApp(App[None]):
             self._append_system_message("There is no active reply to interrupt.")
             self._status_message = "There is no active reply to interrupt."
             return
+        if self._stopping_turn_id == self._active_turn.turn_id:
+            self._status_message = "Stopping active reply."
+            return
+        if self._request_runtime_cancel():
+            self._stopping_turn_id = self._active_turn.turn_id
+            self._status_message = "Stopping active reply."
+            return
         self._cancel_active_worker()
         self._interrupt_running_turn_items()
         self._remove_thinking_items()
@@ -697,6 +749,15 @@ class AgentWorkbenchApp(App[None]):
         if worker is None or worker.is_finished:
             return
         worker.cancel()
+
+    def _request_runtime_cancel(self) -> bool:
+        """尝试请求底层 EasyHarness runtime 取消当前活跃调用。"""
+
+        cancel = getattr(self._agent, "cancel", None)
+        if not callable(cancel):
+            return False
+        cancel()
+        return True
 
     def _interrupt_running_turn_items(self) -> None:
         """把当前仍处于运行态的展示项收口为中断后的可见历史。"""
@@ -894,6 +955,10 @@ class AgentWorkbenchApp(App[None]):
         """渲染 SmartIPO 系统类消息。"""
 
         message = Text()
+        if item.status == "cancelled":
+            message.append(f"{item.title} · ", style=_LOW_EMPHASIS_STYLE)
+            message.append(item.body, style=_LOW_EMPHASIS_STYLE)
+            return message
         message.append(f"{item.title} · ", style=_CHAT_PREFIX_STYLE)
         message.append(item.body, style="white")
         return message
@@ -931,11 +996,16 @@ class AgentWorkbenchApp(App[None]):
         error = str(item.metadata.get("error", "")).strip()
         if item.status == "failed" and not error:
             error = item.preview or item.body
-        if error:
-            lines.append(AgentWorkbenchApp._render_tool_detail_line("Error", error))
-        if item.preview:
+        if item.status == "failed" and error:
+            lines.append(
+                AgentWorkbenchApp._render_tool_detail_line(
+                    "Error",
+                    AgentWorkbenchApp._summarize_error_text(error),
+                )
+            )
+        if item.status == "completed" and item.preview:
             lines.append(AgentWorkbenchApp._render_tool_detail_line("Summary", item.preview))
-        if item.detail and item.detail != item.preview:
+        if item.status == "completed" and item.detail and item.detail != item.preview:
             lines.append(AgentWorkbenchApp._render_tool_detail_line("Result", item.detail))
         return Group(*lines)
 
@@ -986,11 +1056,11 @@ class AgentWorkbenchApp(App[None]):
         error = str(item.metadata.get("error", "")).strip()
         if item.status == "failed" and not error:
             error = item.preview or item.body
-        if error:
-            lines.append(f"Error {error}")
-        if item.preview:
+        if item.status == "failed" and error:
+            lines.append(f"Error {self._summarize_error_text(error)}")
+        if item.status == "completed" and item.preview:
             lines.append(f"Summary {item.preview}")
-        if item.detail and item.detail != item.preview:
+        if item.status == "completed" and item.detail and item.detail != item.preview:
             lines.append(f"Result {item.detail}")
         return "\n".join(lines)
 
@@ -1005,6 +1075,8 @@ class AgentWorkbenchApp(App[None]):
             return "Running"
         if status == "delta":
             return "Updating"
+        if status == "cancelled":
+            return "Stopped"
         if status == "failed":
             return "Failed"
         return "Done"
@@ -1054,10 +1126,26 @@ class AgentWorkbenchApp(App[None]):
         return str(metadata.get("tool_use_id", "")).strip()
 
     @staticmethod
+    def _summarize_error_text(text: str) -> str:
+        """把异常文本压缩为适合终端主 timeline 展示的摘要。"""
+
+        cleaned = str(text).strip()
+        if not cleaned:
+            return ""
+        if "Traceback (most recent call last):" not in cleaned:
+            return cleaned
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if not lines:
+            return cleaned
+        return lines[-1]
+
+    @staticmethod
     def _format_event_status(event: AgentEvent) -> str:
         if event.kind == "thinking":
             if event.status == "started":
                 return "SmartIPO is thinking."
+            if event.status == "cancelled":
+                return "Interrupted."
             if event.status == "failed":
                 return event.text or "Thinking did not complete."
             return "Thinking complete."
@@ -1066,6 +1154,8 @@ class AgentWorkbenchApp(App[None]):
                 return "SmartIPO is drafting a reply."
             if event.status == "delta":
                 return "SmartIPO is drafting a reply."
+            if event.status == "cancelled":
+                return "Interrupted."
             if event.status == "failed":
                 return event.text or "Reply did not complete."
             return "Reply complete."
@@ -1073,11 +1163,15 @@ class AgentWorkbenchApp(App[None]):
             name = event.name or "tool"
             if event.status == "started":
                 return f"Calling {name}."
+            if event.status == "cancelled":
+                return f"{name} stopped."
             if event.status == "failed":
                 return f"{name} failed."
             return f"{name} finished."
         if event.kind == "compress":
             return "Context compressed."
+        if event.status == "cancelled":
+            return "Interrupted."
         return event.text or "System message."
 
     @staticmethod
