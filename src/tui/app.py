@@ -29,13 +29,15 @@ from vortezwohl.nlp import LevenshteinDistance
 from src.agent import build_default_agent
 
 _TIMELINE_REFRESH_INTERVAL_SECONDS = 0.05
-_THINKING_ANIMATION_FRAME_MS = 150
 _CHAT_PREFIX_STYLE = "bold #d8ffe0"
+_TIMING_STYLE = "#7e9b84"
+_THINKING_STYLE = "bold #88ad8f"
+_TOOL_BLOCK_STYLE = "bold #d8ffe0"
 _SUPPORTED_COMMANDS = ("/stop", "/new", "/help")
 _COMMAND_HELP_TEXT = (
-    "可用命令: /stop 中断当前回复, /new 新会话, /help 查看命令"
+    "Available commands: /stop interrupts the active reply, /new starts a new session, /help shows this help."
 )
-_INPUT_PLACEHOLDER = "输入消息，/stop 中断，/new 新会话，/help 命令"
+_INPUT_PLACEHOLDER = "Send a message. /stop interrupts, /new resets, /help shows commands."
 
 
 @dataclass(slots=True)
@@ -67,9 +69,17 @@ class _PendingTurn:
 class AgentWorkbenchApp(App[None]):
     """运行 SmartIPO EasyHarness agent 的单列本地工作台。"""
 
+    TITLE = "SmartIPO"
+    SUB_TITLE = ""
+
     CSS = """
     Screen {
         layout: vertical;
+        color: white;
+    }
+
+    Header {
+        background: #123225;
         color: white;
     }
 
@@ -113,7 +123,7 @@ class AgentWorkbenchApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("ctrl+n", "new_session", "新会话"),
+        Binding("ctrl+n", "new_session", "New session"),
         Binding("tab,ctrl+i", "autocomplete_command", show=False, priority=True),
     ]
 
@@ -130,7 +140,7 @@ class AgentWorkbenchApp(App[None]):
         self._item_counter = 0
         self._turn_count = 0
         self._turn_serial = 0
-        self._status_message = "工作台已就绪。"
+        self._status_message = "Workbench ready."
         self._active_by_kind: dict[str, str] = {}
         self._active_tools: dict[str, str] = {}
         self._pending_turns: deque[_PendingTurn] = deque()
@@ -218,7 +228,7 @@ class AgentWorkbenchApp(App[None]):
         self._pending_turns.clear()
         self._active_turn = None
         self._active_worker = None
-        self._status_message = "已创建新会话。"
+        self._status_message = "Started a new session."
         self._refresh_view()
 
     @work(thread=True, group="agent", exit_on_error=False)
@@ -235,7 +245,7 @@ class AgentWorkbenchApp(App[None]):
                 return
             self.call_from_thread(self._complete_turn, turn_id)
         except Exception as error:  # pragma: no cover
-            self.call_from_thread(self._show_error, turn_id, f"处理失败: {error}")
+            self.call_from_thread(self._show_error, turn_id, f"Request failed: {error}")
 
     def _apply_agent_event_for_turn(self, turn_id: str, event: AgentEvent) -> None:
         """仅当事件属于当前活跃轮次时，才把它应用到本地展示态。"""
@@ -247,8 +257,6 @@ class AgentWorkbenchApp(App[None]):
     def _apply_agent_event(self, event: AgentEvent) -> None:
         """把 EasyHarness 事件应用到 TUI 本地展示态。"""
 
-        if event.kind != "thinking":
-            self._finalize_provisional_thinking()
         if event.kind == "thinking":
             self._apply_thinking_event(event)
         elif event.kind == "tool":
@@ -269,31 +277,32 @@ class AgentWorkbenchApp(App[None]):
                 self._active_by_kind["thinking"] = self._append_item(
                     kind="thinking",
                     title="thinking",
-                    body=event.text or "",
+                    body="",
                     status="started",
                     started_at=self._parse_started_at(event.started_at),
+                    metadata={"ephemeral": True},
                 )
                 return
             item.status = "started"
-            if event.text:
-                item.body = event.text
+            item.body = ""
             item.metadata["provisional"] = False
+            item.metadata["ephemeral"] = True
             return
         item = self._get_active_thinking_item()
         if item is None:
             return
-        if event.status == "delta" and event.text:
-            item.body += event.text
+        if event.status == "delta":
+            item.body = ""
             item.metadata["provisional"] = False
+            item.metadata["ephemeral"] = True
             return
         if event.status in {"completed", "failed"}:
             self._sync_running_item_duration(item)
-            if event.text:
-                item.body = event.text
             item.status = event.status
             item.duration_ms = max(item.duration_ms, event.duration_ms or 0)
             item.started_at = None
             item.metadata["provisional"] = False
+            item.metadata["ephemeral"] = True
             self._active_by_kind.pop("thinking", None)
 
     def _apply_tool_event(self, event: AgentEvent) -> None:
@@ -335,6 +344,8 @@ class AgentWorkbenchApp(App[None]):
             self._active_tools.pop(tool_key, None)
 
     def _apply_assistant_event(self, event: AgentEvent) -> None:
+        if event.status in {"started", "delta", "completed"}:
+            self._remove_ephemeral_thinking_items()
         if event.status == "started":
             self._active_by_kind["assistant"] = self._append_item(
                 kind="assistant",
@@ -395,9 +406,9 @@ class AgentWorkbenchApp(App[None]):
         if not self._is_active_turn(turn_id):
             return
         self._settle_running_turn_items("completed")
-        self._finalize_provisional_thinking()
+        self._remove_thinking_items()
         self._turn_count += 1
-        self._finish_active_turn(queue_state="completed", status_message="回复完成。")
+        self._finish_active_turn(queue_state="completed", status_message="Reply complete.")
 
     def _show_error(self, turn_id: str, message: str) -> None:
         """在本地展示态中追加错误消息。"""
@@ -405,7 +416,7 @@ class AgentWorkbenchApp(App[None]):
         if not self._is_active_turn(turn_id):
             return
         self._settle_running_turn_items("failed", message=message)
-        self._finalize_provisional_thinking()
+        self._remove_thinking_items()
         self._append_item(
             kind="system",
             title="SmartIPO",
@@ -440,20 +451,24 @@ class AgentWorkbenchApp(App[None]):
             title="thinking",
             status="started",
             started_at=datetime.now(timezone.utc),
-            metadata={"provisional": True},
+            metadata={"provisional": True, "ephemeral": True},
         )
 
-    def _finalize_provisional_thinking(self) -> None:
-        """当真实输出已开始时，收口仅用于等待态展示的本地 thinking。"""
+    def _remove_ephemeral_thinking_items(self) -> None:
+        """在 assistant 真正开始输出后移除临时 thinking 展示项。"""
 
-        item = self._get_active_thinking_item()
-        if item is None or not item.metadata.get("provisional", False):
-            return
-        self._sync_running_item_duration(item)
-        item.status = "completed"
-        item.started_at = None
-        item.metadata["provisional"] = False
         self._active_by_kind.pop("thinking", None)
+        self._items = [
+            item
+            for item in self._items
+            if not (item.kind == "thinking" and item.metadata.get("ephemeral", False))
+        ]
+
+    def _remove_thinking_items(self) -> None:
+        """在一轮结束或异常收口时移除所有 thinking 展示项。"""
+
+        self._active_by_kind.pop("thinking", None)
+        self._items = [item for item in self._items if item.kind != "thinking"]
 
     def _enqueue_turn(self, prompt: str) -> None:
         """把一条用户提交加入本地执行队列。"""
@@ -485,7 +500,7 @@ class AgentWorkbenchApp(App[None]):
         self._active_turn = turn
         self._refresh_turn_queue_metadata()
         self._start_local_thinking()
-        self._status_message = "正在处理排队消息。"
+        self._status_message = "Processing queued message."
         self._refresh_view(force_follow=True)
         self._active_worker = self._run_turn_worker(turn.turn_id, turn.prompt)
 
@@ -643,33 +658,35 @@ class AgentWorkbenchApp(App[None]):
             return True
         if command == "/help":
             self._append_system_message(_COMMAND_HELP_TEXT)
-            self._status_message = "已显示可用命令。"
+            self._status_message = "Displayed the command help."
             return True
         suggestion = self._match_command(command)
         if suggestion:
             self._append_system_message(
-                f"未知命令 {command}。你可以先按 Tab 补全，例如 {suggestion}"
+                f"Unknown command {command}. Press Tab to complete commands like {suggestion}."
             )
         else:
-            self._append_system_message(f"未知命令 {command}。输入 /help 查看可用命令。")
-        self._status_message = "命令未识别。"
+            self._append_system_message(
+                f"Unknown command {command}. Run /help to see available commands."
+            )
+        self._status_message = "Command not recognized."
         return True
 
     def _interrupt_active_turn(self) -> None:
         """中断当前活跃回复，并保留已生成的历史内容。"""
 
         if self._active_turn is None:
-            self._append_system_message("当前没有正在进行的回复。")
-            self._status_message = "当前没有正在进行的回复。"
+            self._append_system_message("There is no active reply to interrupt.")
+            self._status_message = "There is no active reply to interrupt."
             return
         self._cancel_active_worker()
         self._interrupt_running_turn_items()
-        self._finalize_provisional_thinking()
-        self._append_system_message("已中断当前回复。")
+        self._remove_thinking_items()
+        self._append_system_message("Interrupted the active reply.")
         self._turn_count += 1
         self._finish_active_turn(
             queue_state="interrupted",
-            status_message="已中断当前回复。",
+            status_message="Interrupted the active reply.",
         )
 
     def _cancel_active_worker(self) -> None:
@@ -699,7 +716,7 @@ class AgentWorkbenchApp(App[None]):
             self._sync_running_item_duration(item)
             item.status = "failed"
             item.started_at = None
-            item.metadata.setdefault("error", "已中断")
+            item.metadata.setdefault("error", "Interrupted")
         self._active_tools.clear()
 
     def _append_system_message(self, content: str, *, status: str = "completed") -> str:
@@ -723,7 +740,7 @@ class AgentWorkbenchApp(App[None]):
             return False
         input_widget.value = matched_command
         input_widget.cursor_position = len(matched_command)
-        self._status_message = f"已补全命令 {matched_command}"
+        self._status_message = f"Completed command {matched_command}."
         return True
 
     def _match_command(self, raw_command: str) -> str | None:
@@ -793,7 +810,7 @@ class AgentWorkbenchApp(App[None]):
 
         return (
             "SmartIPO\n"
-            f"已完成 {self._turn_count} 轮\n"
+            f"Completed {self._turn_count} turns\n"
             f"{self._status_message}"
         )
 
@@ -802,7 +819,7 @@ class AgentWorkbenchApp(App[None]):
 
         visible_items = self._visible_timeline_items()
         if not visible_items:
-            return "还没有消息。"
+            return "No messages yet."
         return "\n\n".join(self._format_timeline_item(item) for item in visible_items)
 
     def _render_timeline_renderable(self) -> object:
@@ -810,7 +827,7 @@ class AgentWorkbenchApp(App[None]):
 
         visible_items = self._visible_timeline_items()
         if not visible_items:
-            return Text("还没有消息。", style="white")
+            return Text("No messages yet.", style="white")
         renderables: list[object] = []
         for index, item in enumerate(visible_items):
             renderables.append(self._render_timeline_item_renderable(item))
@@ -842,7 +859,7 @@ class AgentWorkbenchApp(App[None]):
 
         if not self._pending_turns:
             return Text("")
-        queue_lines = [Align.center(Text("排队中", style=_CHAT_PREFIX_STYLE))]
+        queue_lines = [Align.center(Text("Queued", style=_CHAT_PREFIX_STYLE))]
         queue_lines.extend(
             Align.center(Text(turn.prompt, style="white")) for turn in self._pending_turns
         )
@@ -857,6 +874,10 @@ class AgentWorkbenchApp(App[None]):
             return self._render_chat_message_renderable(item)
         if item.kind in {"system", "compress"}:
             return self._render_system_message_renderable(item)
+        if item.kind == "thinking":
+            return self._render_thinking_item_renderable(item)
+        if item.kind == "tool":
+            return self._render_tool_item_renderable(item)
         return Text(self._format_timeline_item(item), style="white")
 
     @staticmethod
@@ -877,11 +898,61 @@ class AgentWorkbenchApp(App[None]):
         message.append(item.body, style="white")
         return message
 
+    @staticmethod
+    def _render_thinking_item_renderable(item: _TimelineItem) -> Text:
+        """渲染临时 thinking 活动行。"""
+
+        message = Text()
+        message.append(AgentWorkbenchApp._format_duration(item.duration_ms), style=_TIMING_STYLE)
+        message.append(" · ", style=_TIMING_STYLE)
+        message.append("Thinking ...", style=_THINKING_STYLE)
+        return message
+
+    @staticmethod
+    def _render_tool_item_renderable(item: _TimelineItem) -> Group:
+        """渲染工具活动主行与后续概要行。"""
+
+        lines: list[Text] = []
+        main_line = Text()
+        main_line.append(AgentWorkbenchApp._format_duration(item.duration_ms), style=_TIMING_STYLE)
+        main_line.append(" · ", style=_TIMING_STYLE)
+        main_line.append("{ ", style=_TOOL_BLOCK_STYLE)
+        main_line.append("Tool", style=_TOOL_BLOCK_STYLE)
+        main_line.append(f" {item.name or 'tool'}", style="white")
+        main_line.append(" · ", style=_TOOL_BLOCK_STYLE)
+        main_line.append(AgentWorkbenchApp._format_status_label(item.status), style=_TOOL_BLOCK_STYLE)
+        main_line.append(" }", style=_TOOL_BLOCK_STYLE)
+        lines.append(main_line)
+
+        tool_use_id = AgentWorkbenchApp._tool_use_id_from_metadata(item.metadata)
+        if tool_use_id:
+            lines.append(AgentWorkbenchApp._render_tool_detail_line("Call", tool_use_id))
+
+        error = str(item.metadata.get("error", "")).strip()
+        if item.status == "failed" and not error:
+            error = item.preview or item.body
+        if error:
+            lines.append(AgentWorkbenchApp._render_tool_detail_line("Error", error))
+        if item.preview:
+            lines.append(AgentWorkbenchApp._render_tool_detail_line("Summary", item.preview))
+        if item.detail and item.detail != item.preview:
+            lines.append(AgentWorkbenchApp._render_tool_detail_line("Result", item.detail))
+        return Group(*lines)
+
+    @staticmethod
+    def _render_tool_detail_line(label: str, value: str) -> Text:
+        """渲染工具活动的英文后续标签行。"""
+
+        line = Text()
+        line.append(f"{label} ", style=_TOOL_BLOCK_STYLE)
+        line.append(value, style="white")
+        return line
+
     def _format_timeline_item(self, item: _TimelineItem) -> str:
         if item.kind in {"user", "assistant", "system", "compress"}:
             return self._format_message_item(item)
         if item.kind == "thinking":
-            return f"{self._format_duration(item.duration_ms)} · 思考 {self._thinking_label(item)}"
+            return f"{self._format_duration(item.duration_ms)} · Thinking ..."
         return self._format_tool_item(item)
 
     def _format_message_item(self, item: _TimelineItem) -> str:
@@ -907,20 +978,20 @@ class AgentWorkbenchApp(App[None]):
 
     def _format_tool_item(self, item: _TimelineItem) -> str:
         lines = [
-            f"工具 {item.name or 'tool'} · {self._format_status_label(item.status)} · {self._format_duration(item.duration_ms)}"
+            f"{self._format_duration(item.duration_ms)} · {{ Tool {item.name or 'tool'} · {self._format_status_label(item.status)} }}"
         ]
         tool_use_id = self._tool_use_id_from_metadata(item.metadata)
         if tool_use_id:
-            lines.append(f"调用 {tool_use_id}")
+            lines.append(f"Call {tool_use_id}")
         error = str(item.metadata.get("error", "")).strip()
         if item.status == "failed" and not error:
             error = item.preview or item.body
         if error:
-            lines.append(f"错误 {error}")
+            lines.append(f"Error {error}")
         if item.preview:
-            lines.append(f"概要 {item.preview}")
+            lines.append(f"Summary {item.preview}")
         if item.detail and item.detail != item.preview:
-            lines.append(f"结果 {item.detail}")
+            lines.append(f"Result {item.detail}")
         return "\n".join(lines)
 
     def _focus_chat_input(self) -> None:
@@ -931,27 +1002,16 @@ class AgentWorkbenchApp(App[None]):
     @staticmethod
     def _format_status_label(status: str) -> str:
         if status == "started":
-            return "进行中"
+            return "Running"
         if status == "delta":
-            return "更新中"
+            return "Updating"
         if status == "failed":
-            return "失败"
-        return "完成"
+            return "Failed"
+        return "Done"
 
     @staticmethod
     def _format_duration(duration_ms: int) -> str:
         return f"{duration_ms / 1000:.2f}s"
-
-    @staticmethod
-    def _thinking_label(item: _TimelineItem) -> str:
-        body = item.body.strip()
-        if item.status != "started":
-            return body or "thinking"
-        cycle = (item.duration_ms // _THINKING_ANIMATION_FRAME_MS) % 3
-        suffix = (".", "..", "...")[cycle]
-        if body:
-            return body
-        return suffix
 
     @staticmethod
     def _parse_started_at(value: str | None) -> datetime | None:
@@ -997,28 +1057,28 @@ class AgentWorkbenchApp(App[None]):
     def _format_event_status(event: AgentEvent) -> str:
         if event.kind == "thinking":
             if event.status == "started":
-                return "SmartIPO 正在思考"
+                return "SmartIPO is thinking."
             if event.status == "failed":
-                return event.text or "思考没有完成"
-            return "思考完成"
+                return event.text or "Thinking did not complete."
+            return "Thinking complete."
         if event.kind == "assistant":
             if event.status == "started":
-                return "SmartIPO 正在组织回复"
+                return "SmartIPO is drafting a reply."
             if event.status == "delta":
-                return "SmartIPO 正在组织回复"
+                return "SmartIPO is drafting a reply."
             if event.status == "failed":
-                return event.text or "回复没有完成"
-            return "回复完成"
+                return event.text or "Reply did not complete."
+            return "Reply complete."
         if event.kind == "tool":
             name = event.name or "tool"
             if event.status == "started":
-                return f"正在调用 {name}"
+                return f"Calling {name}."
             if event.status == "failed":
-                return f"{name} 调用失败"
-            return f"{name} 调用完成"
+                return f"{name} failed."
+            return f"{name} finished."
         if event.kind == "compress":
-            return "上下文已整理"
-        return event.text or "系统消息"
+            return "Context compressed."
+        return event.text or "System message."
 
     @staticmethod
     def _should_follow_scroll(scroll_widget: VerticalScroll) -> bool:

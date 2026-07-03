@@ -138,10 +138,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.prompts, ["整理 README"])
         self.assertIn("User > 整理 README", text)
-        self.assertIn("fileglide_read_text", text)
-        self.assertIn("调用 tool-1", text)
-        self.assertIn("概要 fileglide_read_text: README.md", text)
-        self.assertIn("结果 README.md", text)
+        self.assertIn("0.01s · { Tool fileglide_read_text · Done }", text)
+        self.assertIn("Call tool-1", text)
+        self.assertIn("Summary fileglide_read_text: README.md", text)
+        self.assertIn("Result README.md", text)
         self.assertIn("Assistant > 已完成", text)
 
     async def test_failed_tool_event_is_visible(self) -> None:
@@ -173,8 +173,8 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             text = app._render_timeline_text()
 
-        self.assertIn("工具 fileglide_edit_text · 失败", text)
-        self.assertIn("错误 permission denied", text)
+        self.assertIn("0.00s · { Tool fileglide_edit_text · Failed }", text)
+        self.assertIn("Error permission denied", text)
 
     async def test_system_failure_is_rendered(self) -> None:
         """系统失败事件应进入本地展示态。"""
@@ -223,9 +223,9 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             final_text = app._render_timeline_text()
 
-        self.assertIn("思考", waiting_text)
+        self.assertIn("Thinking ...", waiting_text)
         self.assertIn("Assistant > 收到", final_text)
-        self.assertIn("思考", final_text)
+        self.assertNotIn("Thinking ...", final_text)
 
     async def test_agent_event_follows_bottom_when_user_is_near_bottom(self) -> None:
         """用户靠近底部时，新事件到来仍应自动跟随到底部。"""
@@ -327,6 +327,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 for aligned in queue_renderable.renderables[1:]
             )
         )
+        self.assertEqual(queue_renderable.renderables[0].renderable.plain, "Queued")
         self.assertIn("第二条", queue_text)
         self.assertIn("第三条", queue_text)
         self.assertIn("Assistant > 第一条完成", final_text)
@@ -364,11 +365,11 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.prompts, ["第一条", "第二条"])
         self.assertIn("User > 第一条", text)
-        self.assertIn("处理失败: boom", text)
+        self.assertIn("Request failed: boom", text)
         self.assertIn("Assistant > 第二条完成", text)
 
-    def test_running_thinking_entry_renders_local_animation(self) -> None:
-        """thinking started 条目应以本地动画渲染。"""
+    def test_running_thinking_entry_renders_english_waiting_label(self) -> None:
+        """thinking started 条目应以英文等待标签渲染。"""
 
         app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
         app._append_user_message("你好")
@@ -378,7 +379,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         text = app._render_timeline_text()
 
-        self.assertIn("0.80s · 思考 ...", text)
+        self.assertIn("0.80s · Thinking ...", text)
 
     def test_running_thinking_entry_uses_utc_started_at_for_timer(self) -> None:
         """UTC started_at 不应被当成本地时间，避免计时跳到数小时。"""
@@ -413,9 +414,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(thinking_items[0], first_item)
         self.assertEqual(thinking_items[0].started_at, first_started_at)
         self.assertFalse(thinking_items[0].metadata.get("provisional", False))
+        self.assertTrue(thinking_items[0].metadata.get("ephemeral", False))
 
-    def test_non_thinking_event_finalizes_local_placeholder(self) -> None:
-        """若模型直接进入真实输出，本地占位 thinking 应先被收口。"""
+    def test_non_assistant_event_keeps_local_placeholder_visible(self) -> None:
+        """在 assistant 真正输出前，非 assistant 事件不应移除本地 thinking。"""
 
         app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
         app._start_local_thinking()
@@ -424,9 +426,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         time.sleep(0.02)
         app._apply_agent_event(_started_event("tool", name="fileglide_read_text"))
 
-        self.assertEqual(thinking_item.status, "completed")
-        self.assertIsNone(thinking_item.started_at)
-        self.assertGreater(thinking_item.duration_ms, 0)
+        self.assertEqual(thinking_item.status, "started")
+        self.assertIsNotNone(thinking_item.started_at)
+        self.assertIn(thinking_item, app._items)
+        self.assertIn("0.00s · { Tool fileglide_read_text · Running }", app._render_timeline_text())
 
     def test_new_session_resets_agent_and_local_state(self) -> None:
         """新会话应同时重置 agent 和 TUI 本地展示态。"""
@@ -439,7 +442,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.reset_count, 1)
         self.assertEqual(app._turn_count, 0)
-        self.assertEqual(app._render_timeline_text(), "还没有消息。")
+        self.assertEqual(app._render_timeline_text(), "No messages yet.")
         self.assertEqual(app._render_queue_tray_text(), "")
 
     async def test_queue_tray_is_hidden_without_pending_turns(self) -> None:
@@ -469,8 +472,9 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             input_widget = app.query_one("#chat-input", Input)
             self.assertEqual(
                 input_widget.placeholder,
-                "输入消息，/stop 中断，/new 新会话，/help 命令",
+                "Send a message. /stop interrupts, /new resets, /help shows commands.",
             )
+            self.assertEqual(app.title, "SmartIPO")
             fake_event = type(
                 "FakeSubmittedEvent",
                 (),
@@ -501,7 +505,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, [])
-        self.assertIn("可用命令: /stop 中断当前回复", text)
+        self.assertIn("Available commands: /stop interrupts the active reply", text)
         self.assertEqual(app._render_queue_tray_text(), "")
 
     async def test_tab_binding_action_autocompletes_supported_slash_command(self) -> None:
@@ -547,7 +551,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertIn("Assistant > 这是半句", text)
-        self.assertIn("SmartIPO · 已中断当前回复。", text)
+        self.assertIn("SmartIPO · Interrupted the active reply.", text)
         self.assertIsNone(app._active_turn)
         self.assertEqual(app._turn_count, 1)
 
@@ -577,7 +581,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(agent.reset_count, 1)
-        self.assertEqual(app._render_timeline_text(), "还没有消息。")
+        self.assertEqual(app._render_timeline_text(), "No messages yet.")
         self.assertEqual(app._render_queue_tray_text(), "")
 
     def test_stale_turn_event_is_ignored_after_new_session(self) -> None:
@@ -595,7 +599,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             AgentEvent(kind="assistant", status="delta", text="旧输出"),
         )
 
-        self.assertEqual(app._render_timeline_text(), "还没有消息。")
+        self.assertEqual(app._render_timeline_text(), "No messages yet.")
 
 
 if __name__ == "__main__":
