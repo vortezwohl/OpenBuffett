@@ -15,19 +15,27 @@ from typing import Any
 from easyharness import AgentEvent
 from rich.align import Align
 from rich.console import Group
-from rich.panel import Panel
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual import events
+from textual.worker import Worker, get_current_worker
 from textual.widgets import Footer, Header, Input, Static
+from vortezwohl.nlp import LevenshteinDistance
 
 from src.agent import build_default_agent
 
 _TIMELINE_REFRESH_INTERVAL_SECONDS = 0.05
 _THINKING_ANIMATION_FRAME_MS = 150
+_CHAT_PREFIX_STYLE = "bold #d8ffe0"
+_SUPPORTED_COMMANDS = ("/stop", "/new", "/help")
+_COMMAND_HELP_TEXT = (
+    "可用命令: /stop 中断当前回复, /new 新会话, /help 查看命令"
+)
+_INPUT_PLACEHOLDER = "输入消息，/stop 中断，/new 新会话，/help 命令"
 
 
 @dataclass(slots=True)
@@ -106,6 +114,7 @@ class AgentWorkbenchApp(App[None]):
 
     BINDINGS = [
         Binding("ctrl+n", "new_session", "新会话"),
+        Binding("tab,ctrl+i", "autocomplete_command", show=False, priority=True),
     ]
 
     def __init__(self, *, agent: Any | None = None) -> None:
@@ -126,6 +135,8 @@ class AgentWorkbenchApp(App[None]):
         self._active_tools: dict[str, str] = {}
         self._pending_turns: deque[_PendingTurn] = deque()
         self._active_turn: _PendingTurn | None = None
+        self._active_worker: Worker[None] | None = None
+        self._command_matcher = LevenshteinDistance(ignore_case=True)
 
     def compose(self) -> ComposeResult:
         """构建 TUI 布局。"""
@@ -137,7 +148,7 @@ class AgentWorkbenchApp(App[None]):
                 yield Static(id="timeline-view")
             yield Static(id="queue-tray")
             yield Input(
-                placeholder="SmartIPO 在线为你解答 ...",
+                placeholder=_INPUT_PLACEHOLDER,
                 id="chat-input",
             )
         yield Footer()
@@ -159,13 +170,43 @@ class AgentWorkbenchApp(App[None]):
         event.input.value = ""
         if not prompt:
             return
+        if self._handle_slash_command(prompt):
+            self._refresh_view(force_follow=True)
+            return
         self._enqueue_turn(prompt)
         self._start_next_turn_if_idle()
         self._refresh_view(force_follow=True)
 
+    def on_key(self, event: events.Key) -> None:
+        """在输入框聚焦时拦截 Tab，用于 slash 命令补全。"""
+
+        if event.key != "tab":
+            return
+        try:
+            input_widget = self.query_one("#chat-input", Input)
+        except (NoMatches, ScreenStackError):
+            return
+        if not input_widget.has_focus:
+            return
+        if self._autocomplete_command_input(input_widget):
+            event.prevent_default()
+            event.stop()
+
+    def action_autocomplete_command(self) -> None:
+        """通过高优先级 binding 触发 slash 命令补全。"""
+
+        try:
+            input_widget = self.query_one("#chat-input", Input)
+        except (NoMatches, ScreenStackError):
+            return
+        if not input_widget.has_focus:
+            return
+        self._autocomplete_command_input(input_widget)
+
     def action_new_session(self) -> None:
         """清空界面并重置当前 EasyHarness 会话。"""
 
+        self._cancel_active_worker()
         reset = getattr(self._agent, "reset", None)
         if callable(reset):
             reset()
@@ -176,6 +217,7 @@ class AgentWorkbenchApp(App[None]):
         self._active_tools.clear()
         self._pending_turns.clear()
         self._active_turn = None
+        self._active_worker = None
         self._status_message = "已创建新会话。"
         self._refresh_view()
 
@@ -184,8 +226,13 @@ class AgentWorkbenchApp(App[None]):
         """在后台线程中执行一轮流式会话。"""
 
         try:
+            worker = get_current_worker()
             for event in self._agent.stream(prompt):
+                if worker.is_cancelled:
+                    return
                 self.call_from_thread(self._apply_agent_event_for_turn, turn_id, event)
+            if worker.is_cancelled:
+                return
             self.call_from_thread(self._complete_turn, turn_id)
         except Exception as error:  # pragma: no cover
             self.call_from_thread(self._show_error, turn_id, f"处理失败: {error}")
@@ -213,7 +260,7 @@ class AgentWorkbenchApp(App[None]):
         elif event.kind == "compress":
             self._apply_compress_event(event)
         self._status_message = self._format_event_status(event)
-        self._refresh_view(force_follow=True)
+        self._refresh_view()
 
     def _apply_thinking_event(self, event: AgentEvent) -> None:
         if event.status == "started":
@@ -291,7 +338,7 @@ class AgentWorkbenchApp(App[None]):
         if event.status == "started":
             self._active_by_kind["assistant"] = self._append_item(
                 kind="assistant",
-                title="🤖",
+                title="Assistant > ",
                 status="started",
                 started_at=self._parse_started_at(event.started_at),
             )
@@ -300,7 +347,7 @@ class AgentWorkbenchApp(App[None]):
         if item is None and event.text:
             key = self._append_item(
                 kind="assistant",
-                title="🤖",
+                title="Assistant > ",
                 body="",
                 status=event.status,
                 started_at=self._parse_started_at(event.started_at),
@@ -378,7 +425,7 @@ class AgentWorkbenchApp(App[None]):
 
         return self._append_item(
             kind="user",
-            title="👨‍💻",
+            title="User > ",
             body=content,
             metadata=metadata,
         )
@@ -440,13 +487,14 @@ class AgentWorkbenchApp(App[None]):
         self._start_local_thinking()
         self._status_message = "正在处理排队消息。"
         self._refresh_view(force_follow=True)
-        self._run_turn_worker(turn.turn_id, turn.prompt)
+        self._active_worker = self._run_turn_worker(turn.turn_id, turn.prompt)
 
     def _finish_active_turn(self, *, queue_state: str, status_message: str) -> None:
         """收尾当前活跃轮次，并在可能时启动下一条。"""
 
         if self._active_turn is None:
             return
+        self._active_worker = None
         item = self._get_item(self._active_turn.user_item_key)
         if item is not None:
             item.metadata["queue_state"] = queue_state
@@ -581,6 +629,125 @@ class AgentWorkbenchApp(App[None]):
         if changed:
             self._render_timeline()
 
+    def _handle_slash_command(self, prompt: str) -> bool:
+        """在 TUI 内部处理 slash 命令，不把它们送入 agent 队列。"""
+
+        if not prompt.startswith("/"):
+            return False
+        command = prompt.split(maxsplit=1)[0].strip().casefold()
+        if command == "/stop":
+            self._interrupt_active_turn()
+            return True
+        if command == "/new":
+            self.action_new_session()
+            return True
+        if command == "/help":
+            self._append_system_message(_COMMAND_HELP_TEXT)
+            self._status_message = "已显示可用命令。"
+            return True
+        suggestion = self._match_command(command)
+        if suggestion:
+            self._append_system_message(
+                f"未知命令 {command}。你可以先按 Tab 补全，例如 {suggestion}"
+            )
+        else:
+            self._append_system_message(f"未知命令 {command}。输入 /help 查看可用命令。")
+        self._status_message = "命令未识别。"
+        return True
+
+    def _interrupt_active_turn(self) -> None:
+        """中断当前活跃回复，并保留已生成的历史内容。"""
+
+        if self._active_turn is None:
+            self._append_system_message("当前没有正在进行的回复。")
+            self._status_message = "当前没有正在进行的回复。"
+            return
+        self._cancel_active_worker()
+        self._interrupt_running_turn_items()
+        self._finalize_provisional_thinking()
+        self._append_system_message("已中断当前回复。")
+        self._turn_count += 1
+        self._finish_active_turn(
+            queue_state="interrupted",
+            status_message="已中断当前回复。",
+        )
+
+    def _cancel_active_worker(self) -> None:
+        """取消当前后台 worker，并清理本地引用。"""
+
+        worker = self._active_worker
+        self._active_worker = None
+        if worker is None or worker.is_finished:
+            return
+        worker.cancel()
+
+    def _interrupt_running_turn_items(self) -> None:
+        """把当前仍处于运行态的展示项收口为中断后的可见历史。"""
+
+        for key in list(self._active_by_kind.values()):
+            item = self._get_item(key)
+            if item is None:
+                continue
+            self._sync_running_item_duration(item)
+            item.status = "completed"
+            item.started_at = None
+        self._active_by_kind.clear()
+        for key in list(self._active_tools.values()):
+            item = self._get_item(key)
+            if item is None:
+                continue
+            self._sync_running_item_duration(item)
+            item.status = "failed"
+            item.started_at = None
+            item.metadata.setdefault("error", "已中断")
+        self._active_tools.clear()
+
+    def _append_system_message(self, content: str, *, status: str = "completed") -> str:
+        """追加一条 SmartIPO 系统消息。"""
+
+        return self._append_item(
+            kind="system",
+            title="SmartIPO",
+            body=content,
+            status=status,
+        )
+
+    def _autocomplete_command_input(self, input_widget: Input) -> bool:
+        """对以 `/` 开头的当前输入执行闭集命令补全。"""
+
+        current_value = input_widget.value.strip()
+        if not current_value.startswith("/") or " " in current_value:
+            return False
+        matched_command = self._match_command(current_value)
+        if matched_command is None or matched_command == current_value.casefold():
+            return False
+        input_widget.value = matched_command
+        input_widget.cursor_position = len(matched_command)
+        self._status_message = f"已补全命令 {matched_command}"
+        return True
+
+    def _match_command(self, raw_command: str) -> str | None:
+        """匹配闭集 slash 命令，优先前缀命中，再回退到莱温斯坦距离。"""
+
+        command = raw_command.strip().casefold()
+        if not command.startswith("/"):
+            return None
+        if command in _SUPPORTED_COMMANDS:
+            return command
+        prefix_matches = [
+            candidate for candidate in _SUPPORTED_COMMANDS if candidate.startswith(command)
+        ]
+        if prefix_matches:
+            return prefix_matches[0]
+        ranked_commands = self._command_matcher.rank(command, list(_SUPPORTED_COMMANDS))
+        if not ranked_commands:
+            return None
+        best_match = ranked_commands[0]
+        max_distance = max(1, min(2, len(best_match) // 3))
+        if self._command_matcher(command, best_match) > max_distance:
+            return None
+        return best_match
+
     def _refresh_view(self, *, force_follow: bool = False) -> None:
         """刷新顶部状态和会话记录。"""
 
@@ -602,7 +769,7 @@ class AgentWorkbenchApp(App[None]):
         except (NoMatches, ScreenStackError):
             return
         should_follow = force_follow or self._should_follow_scroll(scroll_widget)
-        timeline_widget.update(Text(self._render_timeline_text()))
+        timeline_widget.update(self._render_timeline_renderable())
         if should_follow:
             self.call_after_refresh(
                 scroll_widget.scroll_end,
@@ -633,7 +800,28 @@ class AgentWorkbenchApp(App[None]):
     def _render_timeline_text(self) -> str:
         """把本地展示项渲染为文本。"""
 
-        visible_items = [
+        visible_items = self._visible_timeline_items()
+        if not visible_items:
+            return "还没有消息。"
+        return "\n\n".join(self._format_timeline_item(item) for item in visible_items)
+
+    def _render_timeline_renderable(self) -> object:
+        """把主消息区渲染为 Rich renderable，便于局部着色。"""
+
+        visible_items = self._visible_timeline_items()
+        if not visible_items:
+            return Text("还没有消息。", style="white")
+        renderables: list[object] = []
+        for index, item in enumerate(visible_items):
+            renderables.append(self._render_timeline_item_renderable(item))
+            if index < len(visible_items) - 1:
+                renderables.append(Text(""))
+        return Group(*renderables)
+
+    def _visible_timeline_items(self) -> list[_TimelineItem]:
+        """返回当前应在 timeline 中可见的展示项。"""
+
+        return [
             item
             for item in self._items
             if not (
@@ -641,9 +829,6 @@ class AgentWorkbenchApp(App[None]):
                 and str(item.metadata.get("queue_state", "")).strip() == "queued"
             )
         ]
-        if not visible_items:
-            return "还没有消息。"
-        return "\n\n".join(self._format_timeline_item(item) for item in visible_items)
 
     def _render_queue_tray_text(self) -> str:
         """把待处理队列渲染为纯文本，便于测试验证。"""
@@ -653,21 +838,44 @@ class AgentWorkbenchApp(App[None]):
         return "\n".join(turn.prompt for turn in self._pending_turns)
 
     def _render_queue_tray_renderable(self) -> object:
-        """把待处理队列渲染为居中泡泡。"""
+        """把待处理队列渲染为扁平、居中的轻量列表。"""
 
         if not self._pending_turns:
             return Text("")
-        bubbles = [
-            Align.center(
-                Panel.fit(
-                    Text(turn.prompt, style="bold white"),
-                    border_style="#effff1",
-                    padding=(0, 1),
-                )
-            )
-            for turn in self._pending_turns
-        ]
-        return Group(*bubbles)
+        queue_lines = [Align.center(Text("排队中", style=_CHAT_PREFIX_STYLE))]
+        queue_lines.extend(
+            Align.center(Text(turn.prompt, style="white")) for turn in self._pending_turns
+        )
+        return Group(*queue_lines)
+
+    def _render_timeline_item_renderable(self, item: _TimelineItem) -> object:
+        """把单条 timeline 项渲染为带局部样式的 Rich 对象。"""
+
+        if item.kind == "user":
+            return self._render_chat_message_renderable(item)
+        if item.kind == "assistant":
+            return self._render_chat_message_renderable(item)
+        if item.kind in {"system", "compress"}:
+            return self._render_system_message_renderable(item)
+        return Text(self._format_timeline_item(item), style="white")
+
+    @staticmethod
+    def _render_chat_message_renderable(item: _TimelineItem) -> Text:
+        """渲染带主题色前缀的用户或助手消息。"""
+
+        message = Text()
+        message.append(item.title, style=_CHAT_PREFIX_STYLE)
+        message.append(item.body, style="white")
+        return message
+
+    @staticmethod
+    def _render_system_message_renderable(item: _TimelineItem) -> Text:
+        """渲染 SmartIPO 系统类消息。"""
+
+        message = Text()
+        message.append(f"{item.title} · ", style=_CHAT_PREFIX_STYLE)
+        message.append(item.body, style="white")
+        return message
 
     def _format_timeline_item(self, item: _TimelineItem) -> str:
         if item.kind in {"user", "assistant", "system", "compress"}:
@@ -689,13 +897,13 @@ class AgentWorkbenchApp(App[None]):
     def _format_user_item(item: _TimelineItem) -> str:
         """按队列状态渲染用户消息。"""
 
-        return f"{item.title} {item.body}"
+        return f"{item.title}{item.body}"
 
     @staticmethod
     def _format_assistant_item(item: _TimelineItem) -> str:
         """按聊天风格渲染助手消息。"""
 
-        return f"{item.title} {item.body}"
+        return f"{item.title}{item.body}"
 
     def _format_tool_item(self, item: _TimelineItem) -> str:
         lines = [

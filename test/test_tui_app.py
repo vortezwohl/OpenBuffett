@@ -11,6 +11,7 @@ import unittest
 from datetime import datetime, timezone
 
 from easyharness import AgentEvent
+from rich.panel import Panel
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static
 
@@ -136,12 +137,12 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, ["整理 README"])
-        self.assertIn("👨‍💻 整理 README", text)
+        self.assertIn("User > 整理 README", text)
         self.assertIn("fileglide_read_text", text)
         self.assertIn("调用 tool-1", text)
         self.assertIn("概要 fileglide_read_text: README.md", text)
         self.assertIn("结果 README.md", text)
-        self.assertIn("🤖 已完成", text)
+        self.assertIn("Assistant > 已完成", text)
 
     async def test_failed_tool_event_is_visible(self) -> None:
         """工具失败事件必须在 TUI 中明确展示为失败。"""
@@ -223,11 +224,11 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             final_text = app._render_timeline_text()
 
         self.assertIn("思考", waiting_text)
-        self.assertIn("🤖 收到", final_text)
+        self.assertIn("Assistant > 收到", final_text)
         self.assertIn("思考", final_text)
 
-    async def test_agent_event_forces_scroll_follow_to_bottom(self) -> None:
-        """模型新事件到来时应自动把时间线滚动到底部。"""
+    async def test_agent_event_follows_bottom_when_user_is_near_bottom(self) -> None:
+        """用户靠近底部时，新事件到来仍应自动跟随到底部。"""
 
         app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
 
@@ -239,8 +240,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
             scroll_widget = app.query_one("#timeline-scroll", VerticalScroll)
             self.assertGreater(scroll_widget.max_scroll_y, 0)
-
-            scroll_widget.scroll_home(animate=False)
+            scroll_widget.scroll_end(animate=False)
             await pilot.pause(0.1)
 
             app._apply_agent_event(
@@ -249,6 +249,30 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
 
             self.assertEqual(scroll_widget.scroll_y, scroll_widget.max_scroll_y)
+
+    async def test_agent_event_keeps_manual_scroll_position_when_user_away_from_bottom(self) -> None:
+        """用户滚离底部后，新事件到来不应强制把 timeline 拉回到底部。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        async with app.run_test() as pilot:
+            for index in range(40):
+                app._append_user_message(f"历史消息 {index}")
+            app._refresh_view()
+            await pilot.pause(0.1)
+
+            scroll_widget = app.query_one("#timeline-scroll", VerticalScroll)
+            scroll_widget.scroll_home(animate=False)
+            await pilot.pause(0.1)
+            old_scroll_y = scroll_widget.scroll_y
+
+            app._apply_agent_event(
+                AgentEvent(kind="assistant", status="delta", text="新输出")
+            )
+            await pilot.pause(0.1)
+
+            self.assertEqual(scroll_widget.scroll_y, old_scroll_y)
+            self.assertLess(scroll_widget.scroll_y, scroll_widget.max_scroll_y)
 
     async def test_multiple_submissions_are_queued_and_run_in_order(self) -> None:
         """多次提交应按顺序串行执行，排队消息只显示在独立托盘。"""
@@ -285,6 +309,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             queue_widget = app.query_one("#queue-tray", Static)
             waiting_text = app._render_timeline_text()
             queue_text = app._render_queue_tray_text()
+            queue_renderable = app._render_queue_tray_renderable()
             queue_visible_during_wait = queue_widget.display
             await pilot.pause(0.65)
             final_text = app._render_timeline_text()
@@ -292,15 +317,21 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             final_queue_visible = queue_widget.display
 
         self.assertEqual(agent.prompts, ["第一条", "第二条", "第三条"])
-        self.assertIn("👨‍💻 第一条", waiting_text)
+        self.assertIn("User > 第一条", waiting_text)
         self.assertNotIn("第二条", waiting_text)
         self.assertNotIn("第三条", waiting_text)
         self.assertTrue(queue_visible_during_wait)
+        self.assertTrue(
+            all(
+                not isinstance(aligned.renderable, Panel)
+                for aligned in queue_renderable.renderables[1:]
+            )
+        )
         self.assertIn("第二条", queue_text)
         self.assertIn("第三条", queue_text)
-        self.assertIn("🤖 第一条完成", final_text)
-        self.assertIn("🤖 第二条完成", final_text)
-        self.assertIn("🤖 第三条完成", final_text)
+        self.assertIn("Assistant > 第一条完成", final_text)
+        self.assertIn("Assistant > 第二条完成", final_text)
+        self.assertIn("Assistant > 第三条完成", final_text)
         self.assertEqual(final_queue_text, "")
         self.assertFalse(final_queue_visible)
 
@@ -332,9 +363,9 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, ["第一条", "第二条"])
-        self.assertIn("👨‍💻 第一条", text)
+        self.assertIn("User > 第一条", text)
         self.assertIn("处理失败: boom", text)
-        self.assertIn("🤖 第二条完成", text)
+        self.assertIn("Assistant > 第二条完成", text)
 
     def test_running_thinking_entry_renders_local_animation(self) -> None:
         """thinking started 条目应以本地动画渲染。"""
@@ -423,7 +454,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(queue_widget.display)
         self.assertEqual(app._render_queue_tray_text(), "")
 
-    async def test_input_placeholder_and_icon_prefixes_are_updated(self) -> None:
+    async def test_input_placeholder_and_text_prefixes_are_updated(self) -> None:
         """输入框文案和对话前缀应切换到新的聊天视觉语言。"""
 
         agent = _FakeStreamingAgent(
@@ -436,7 +467,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test() as pilot:
             input_widget = app.query_one("#chat-input", Input)
-            self.assertEqual(input_widget.placeholder, "SmartIPO 在线为你解答 ...")
+            self.assertEqual(
+                input_widget.placeholder,
+                "输入消息，/stop 中断，/new 新会话，/help 命令",
+            )
             fake_event = type(
                 "FakeSubmittedEvent",
                 (),
@@ -446,8 +480,105 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             text = app._render_timeline_text()
 
-        self.assertIn("👨‍💻 hi", text)
-        self.assertIn("🤖 你好，我是 SmartIPO", text)
+        self.assertIn("User > hi", text)
+        self.assertIn("Assistant > 你好，我是 SmartIPO", text)
+
+    async def test_help_command_is_handled_inside_tui(self) -> None:
+        """/help 应直接在 TUI 内部处理，而不是进入 agent 排队。"""
+
+        agent = _FakeStreamingAgent([])
+        app = AgentWorkbenchApp(agent=agent)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            fake_event = type(
+                "FakeSubmittedEvent",
+                (),
+                {"input": input_widget, "value": "/help"},
+            )()
+            app.on_input_submitted(fake_event)
+            await pilot.pause(0.1)
+            text = app._render_timeline_text()
+
+        self.assertEqual(agent.prompts, [])
+        self.assertIn("可用命令: /stop 中断当前回复", text)
+        self.assertEqual(app._render_queue_tray_text(), "")
+
+    async def test_tab_binding_action_autocompletes_supported_slash_command(self) -> None:
+        """Tab 绑定触发的命令补全应选出闭集中的最佳匹配。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            input_widget.focus()
+            await pilot.pause(0.05)
+            input_widget.value = "/stp"
+            app.action_autocomplete_command()
+            await pilot.pause(0.1)
+
+        self.assertEqual(input_widget.value, "/stop")
+
+    async def test_stop_command_preserves_partial_assistant_reply(self) -> None:
+        """/stop 应保留已生成的半截 assistant 回复，并收口当前 turn。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._enqueue_turn("分析一下")
+        app._active_turn = app._pending_turns.popleft()
+        app._refresh_turn_queue_metadata()
+        assistant_key = app._append_item(
+            kind="assistant",
+            title="Assistant > ",
+            body="这是半句",
+            status="started",
+            started_at=datetime.now(timezone.utc),
+        )
+        app._active_by_kind["assistant"] = assistant_key
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            fake_event = type(
+                "FakeSubmittedEvent",
+                (),
+                {"input": input_widget, "value": "/stop"},
+            )()
+            app.on_input_submitted(fake_event)
+            await pilot.pause(0.1)
+            text = app._render_timeline_text()
+
+        self.assertIn("Assistant > 这是半句", text)
+        self.assertIn("SmartIPO · 已中断当前回复。", text)
+        self.assertIsNone(app._active_turn)
+        self.assertEqual(app._turn_count, 1)
+
+    async def test_new_command_resets_session_and_ignores_old_turn_events(self) -> None:
+        """/new 应重置本地会话，并继续忽略旧 turn 的迟到事件。"""
+
+        agent = _FakeStreamingAgent([])
+        app = AgentWorkbenchApp(agent=agent)
+        app._enqueue_turn("旧消息")
+        app._active_turn = app._pending_turns.popleft()
+        app._refresh_turn_queue_metadata()
+        old_turn_id = app._active_turn.turn_id  # type: ignore[union-attr]
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            fake_event = type(
+                "FakeSubmittedEvent",
+                (),
+                {"input": input_widget, "value": "/new"},
+            )()
+            app.on_input_submitted(fake_event)
+            await pilot.pause(0.1)
+
+        app._apply_agent_event_for_turn(
+            old_turn_id,
+            AgentEvent(kind="assistant", status="delta", text="旧输出"),
+        )
+
+        self.assertEqual(agent.reset_count, 1)
+        self.assertEqual(app._render_timeline_text(), "还没有消息。")
+        self.assertEqual(app._render_queue_tray_text(), "")
 
     def test_stale_turn_event_is_ignored_after_new_session(self) -> None:
         """新会话后到达的旧轮次事件不应污染当前界面。"""
