@@ -8,7 +8,7 @@ EasyHarness 提供，本文件不得重新定义跨 UI 共享的 runtime 或 tim
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from easyharness import AgentEvent
@@ -20,7 +20,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Footer, Header, Input, Static
 
-from src.app.default_agent import build_default_agent
+from src.agent import build_default_agent
 
 _TIMELINE_REFRESH_INTERVAL_SECONDS = 0.05
 _THINKING_ANIMATION_FRAME_MS = 150
@@ -177,8 +177,8 @@ class AgentWorkbenchApp(App[None]):
         if event.status == "started":
             self._active_by_kind["thinking"] = self._append_item(
                 kind="thinking",
-                title="AI",
-                body=event.text or "thinking",
+                title="thinking",
+                body=event.text or "",
                 status="started",
                 started_at=self._parse_started_at(event.started_at),
             )
@@ -240,7 +240,7 @@ class AgentWorkbenchApp(App[None]):
         if event.status == "started":
             self._active_by_kind["assistant"] = self._append_item(
                 kind="assistant",
-                title="AI",
+                title="EasyHarness",
                 status="started",
                 started_at=self._parse_started_at(event.started_at),
             )
@@ -249,7 +249,7 @@ class AgentWorkbenchApp(App[None]):
         if item is None and event.text:
             key = self._append_item(
                 kind="assistant",
-                title="AI",
+                title="EasyHarness",
                 body="",
                 status=event.status,
                 started_at=self._parse_started_at(event.started_at),
@@ -356,7 +356,7 @@ class AgentWorkbenchApp(App[None]):
         """刷新仍处于 started 状态的本地展示时长。"""
 
         changed = False
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         for item in self._items:
             if item.started_at is None:
                 continue
@@ -414,7 +414,7 @@ class AgentWorkbenchApp(App[None]):
         if item.kind == "thinking":
             return (
                 f"{self._format_duration(item.duration_ms)} | "
-                f"{item.title}: {self._thinking_label(item)}"
+                f"thinking: {self._thinking_label(item)}"
             )
         return self._format_tool_item(item)
 
@@ -467,22 +467,24 @@ class AgentWorkbenchApp(App[None]):
 
     @staticmethod
     def _thinking_label(item: _TimelineItem) -> str:
+        body = item.body.strip()
         if item.status != "started":
-            return item.body
+            return body or "thinking"
         cycle = (item.duration_ms // _THINKING_ANIMATION_FRAME_MS) % 3
         suffix = (".", "..", "...")[cycle]
-        return f"{item.body or 'thinking'} {suffix}"
+        if body:
+            return body
+        return suffix
 
     @staticmethod
     def _parse_started_at(value: str | None) -> datetime | None:
         if not value:
-            return datetime.now()
+            return datetime.now(timezone.utc)
         try:
             normalized = value.replace("Z", "+00:00")
-            parsed = datetime.fromisoformat(normalized)
-            return parsed.replace(tzinfo=None)
+            return datetime.fromisoformat(normalized)
         except ValueError:
-            return datetime.now()
+            return datetime.now(timezone.utc)
 
     @staticmethod
     def _event_data_dict(event: AgentEvent) -> dict[str, Any]:

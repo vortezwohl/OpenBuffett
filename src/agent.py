@@ -1,20 +1,27 @@
-"""默认 EasyHarness agent 装配入口。
+"""SmartIPO 默认 EasyHarness agent 装配入口。
 
-该文件承担应用 composition 层职责：定义默认 system prompt、默认工具集、
-默认模型和默认 agent 组装。TUI、future WebUI 等界面层只消费这里提供的
-装配结果，不再在 UI 内部定义底层协议和默认运行栈。
+该文件是项目唯一的 agent composition 层，只负责选择默认模型、
+system prompt、工具集合和 workspace root。会话运行时、工具协议、
+事件流和纯文本生成能力均由 EasyHarness 提供。
 """
 
 from __future__ import annotations
 
 import os
 
-from easyharness import Agent
+from dotenv import load_dotenv
+from easyharness import Agent, ModelConfig
 from easyharness.toolset import build_fileglide_tools
 
-from src.service.model_hub import create_default_brain_model
 from src.tool.seedream_image import SEEDREAM_IMAGE_TOOL
 
+load_dotenv()
+
+DEFAULT_MODEL = "openai/deepseek-v4-flash"
+DEFAULT_API_BASE = "https://api.deepseek.com/v1"
+DEFAULT_TEMPERATURE = 0.01
+DEFAULT_TOP_P = 0.01
+DEFAULT_SEED = None
 
 DEFAULT_SYSTEM_PROMPT = """
 你是 SmartIPO 的本地 coding agent。
@@ -45,6 +52,29 @@ DEFAULT_WORKBENCH_TOOL_NAMES = (
 )
 
 
+def build_default_model_config() -> ModelConfig:
+    """构造默认 EasyHarness 模型配置。
+
+    Returns:
+        可直接传入 `easyharness.Agent` 的默认模型配置。
+
+    Raises:
+        RuntimeError: 当 `API_KEY` 未配置或为空时抛出。
+    """
+
+    api_key = os.getenv("API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("API_KEY 未配置，无法创建默认 EasyHarness agent。")
+    return ModelConfig(
+        model=DEFAULT_MODEL,
+        api_key=api_key,
+        base_url=os.getenv("API_BASE", DEFAULT_API_BASE).strip(),
+        temperature=DEFAULT_TEMPERATURE,
+        top_p=DEFAULT_TOP_P,
+        seed=DEFAULT_SEED,
+    )
+
+
 def build_default_tools(workspace_root: str | None = None) -> list[object]:
     """构造默认 EasyHarness 工具对象集合。
 
@@ -63,10 +93,17 @@ def build_default_tools(workspace_root: str | None = None) -> list[object]:
 
 
 def build_default_agent(workspace_root: str | None = None) -> Agent:
-    """构造默认 EasyHarness 本地 agent。"""
+    """构造默认 EasyHarness 本地 agent。
+
+    Args:
+        workspace_root: 默认文件工具作用域根目录；为空时使用当前工作目录。
+
+    Returns:
+        已装配默认模型、system prompt 和工具集合的 EasyHarness agent。
+    """
 
     return Agent(
-        model=create_default_brain_model(),
+        model=build_default_model_config(),
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         tools=build_default_tools(workspace_root),
         enable_fileglide=False,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from datetime import datetime, timezone
 
 from easyharness import AgentEvent
 from textual.widgets import Input
@@ -90,7 +91,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("调用: tool-1", text)
         self.assertIn("概要: fileglide_read_text: README.md", text)
         self.assertIn("结果: README.md", text)
-        self.assertIn("AI: 已完成", text)
+        self.assertIn("EasyHarness: 已完成", text)
 
     async def test_failed_tool_event_is_visible(self) -> None:
         """工具失败事件必须在 TUI 中明确展示为失败。"""
@@ -156,7 +157,24 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         text = app._render_timeline_text()
 
-        self.assertIn("0.80s | AI: thinking ...", text)
+        self.assertIn("0.80s | thinking: ...", text)
+
+    def test_running_thinking_entry_uses_utc_started_at_for_timer(self) -> None:
+        """UTC started_at 不应被当成本地时间，避免计时跳到数小时。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._apply_agent_event(
+            AgentEvent(
+                kind="thinking",
+                status="started",
+                started_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+        time.sleep(0.05)
+        app._refresh_running_items()
+
+        self.assertLess(app._items[-1].duration_ms, 5000)
 
     def test_new_session_resets_agent_and_local_state(self) -> None:
         """新会话应同时重置 agent 和 TUI 本地展示态。"""

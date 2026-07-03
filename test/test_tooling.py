@@ -11,11 +11,12 @@ from unittest.mock import patch
 
 from easyharness import Agent, ModelConfig, ToolOutput
 
-from src.app.default_agent import (
+from src.agent import (
     DEFAULT_BUSINESS_TOOL_NAMES,
     DEFAULT_FILEGLIDE_TOOL_NAMES,
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_WORKBENCH_TOOL_NAMES,
+    build_default_model_config,
     build_default_agent,
     build_default_tools,
 )
@@ -55,6 +56,27 @@ class EasyHarnessToolingTests(unittest.TestCase):
             agent = build_default_agent(".")
 
         self.assertIsInstance(agent, Agent)
+
+    def test_build_default_model_config_returns_model_config(self) -> None:
+        """默认模型配置应直接返回 EasyHarness ModelConfig。"""
+
+        with patch.dict(
+            "os.environ",
+            {
+                "API_KEY": "test-key",
+                "API_BASE": "https://example.com/v1",
+            },
+            clear=False,
+        ):
+            model = build_default_model_config()
+
+        self.assertIsInstance(model, ModelConfig)
+        self.assertEqual(model.model, "openai/deepseek-v4-flash")
+        self.assertEqual(model.api_key, "test-key")
+        self.assertEqual(model.base_url, "https://example.com/v1")
+        self.assertEqual(model.temperature, 0.01)
+        self.assertEqual(model.top_p, 0.01)
+        self.assertIsNone(model.seed)
 
     def test_seedream_tool_returns_tool_output(self) -> None:
         """Seedream 业务工具应返回 EasyHarness ToolOutput。"""
