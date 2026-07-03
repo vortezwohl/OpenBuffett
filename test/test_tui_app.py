@@ -52,6 +52,40 @@ class _DelayedStreamingAgent(_FakeStreamingAgent):
         yield from self.events
 
 
+class _ScriptedStreamingAgent:
+    """按 prompt 返回不同脚本，用于验证队列串行与失败续跑。"""
+
+    def __init__(
+        self,
+        scripts: dict[str, list[AgentEvent]],
+        *,
+        delays: dict[str, float] | None = None,
+        errors: dict[str, BaseException] | None = None,
+    ) -> None:
+        self.scripts = scripts
+        self.delays = delays or {}
+        self.errors = errors or {}
+        self.prompts: list[str] = []
+        self.reset_count = 0
+
+    def stream(self, prompt: str):
+        """按 prompt 执行预设脚本，可选延迟或抛错。"""
+
+        self.prompts.append(prompt)
+        delay_seconds = self.delays.get(prompt, 0)
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        error = self.errors.get(prompt)
+        if error is not None:
+            raise error
+        yield from self.scripts.get(prompt, [])
+
+    def reset(self) -> None:
+        """记录重置次数。"""
+
+        self.reset_count += 1
+
+
 def _started_event(kind: str, *, name: str | None = None) -> AgentEvent:
     """构造 started 阶段测试事件。"""
 
@@ -217,6 +251,82 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(scroll_widget.scroll_y, scroll_widget.max_scroll_y)
 
+    async def test_multiple_submissions_are_queued_and_run_in_order(self) -> None:
+        """多次提交应按顺序串行执行，并在时间线中显示排队顺位。"""
+
+        agent = _ScriptedStreamingAgent(
+            {
+                "第一条": [
+                    _started_event("assistant"),
+                    AgentEvent(kind="assistant", status="completed", text="第一条完成"),
+                ],
+                "第二条": [
+                    _started_event("assistant"),
+                    AgentEvent(kind="assistant", status="completed", text="第二条完成"),
+                ],
+                "第三条": [
+                    _started_event("assistant"),
+                    AgentEvent(kind="assistant", status="completed", text="第三条完成"),
+                ],
+            },
+            delays={"第一条": 0.2, "第二条": 0.1},
+        )
+        app = AgentWorkbenchApp(agent=agent)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            for prompt in ("第一条", "第二条", "第三条"):
+                fake_event = type(
+                    "FakeSubmittedEvent",
+                    (),
+                    {"input": input_widget, "value": prompt},
+                )()
+                app.on_input_submitted(fake_event)
+            await pilot.pause(0.05)
+            waiting_text = app._render_timeline_text()
+            await pilot.pause(0.65)
+            final_text = app._render_timeline_text()
+
+        self.assertEqual(agent.prompts, ["第一条", "第二条", "第三条"])
+        self.assertIn("你 [处理中]: 第一条", waiting_text)
+        self.assertIn("你 [排队中 #1]: 第二条", waiting_text)
+        self.assertIn("你 [排队中 #2]: 第三条", waiting_text)
+        self.assertIn("EasyHarness: 第一条完成", final_text)
+        self.assertIn("EasyHarness: 第二条完成", final_text)
+        self.assertIn("EasyHarness: 第三条完成", final_text)
+
+    async def test_failed_turn_continues_with_next_queued_turn(self) -> None:
+        """当前轮次失败后，下一条排队消息仍应继续执行。"""
+
+        agent = _ScriptedStreamingAgent(
+            {
+                "第二条": [
+                    _started_event("assistant"),
+                    AgentEvent(kind="assistant", status="completed", text="第二条完成"),
+                ]
+            },
+            delays={"第一条": 0.05},
+            errors={"第一条": RuntimeError("boom")},
+        )
+        app = AgentWorkbenchApp(agent=agent)
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            for prompt in ("第一条", "第二条"):
+                fake_event = type(
+                    "FakeSubmittedEvent",
+                    (),
+                    {"input": input_widget, "value": prompt},
+                )()
+                app.on_input_submitted(fake_event)
+            await pilot.pause(0.4)
+            text = app._render_timeline_text()
+
+        self.assertEqual(agent.prompts, ["第一条", "第二条"])
+        self.assertIn("你 [失败]: 第一条", text)
+        self.assertIn("处理失败: boom", text)
+        self.assertIn("EasyHarness: 第二条完成", text)
+
     def test_running_thinking_entry_renders_local_animation(self) -> None:
         """thinking started 条目应以本地动画渲染。"""
 
@@ -289,6 +399,23 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.reset_count, 1)
         self.assertEqual(app._turn_count, 0)
+        self.assertEqual(app._render_timeline_text(), "还没有消息。")
+
+    def test_stale_turn_event_is_ignored_after_new_session(self) -> None:
+        """新会话后到达的旧轮次事件不应污染当前界面。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._enqueue_turn("旧消息")
+        app._active_turn = app._pending_turns.popleft()
+        app._refresh_turn_queue_metadata()
+        old_turn_id = app._active_turn.turn_id  # type: ignore[union-attr]
+
+        app.action_new_session()
+        app._apply_agent_event_for_turn(
+            old_turn_id,
+            AgentEvent(kind="assistant", status="delta", text="旧输出"),
+        )
+
         self.assertEqual(app._render_timeline_text(), "还没有消息。")
 
 

@@ -7,6 +7,7 @@ EasyHarness 提供，本文件不得重新定义跨 UI 共享的 runtime 或 tim
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -41,6 +42,15 @@ class _TimelineItem:
     started_at: datetime | None = None
     duration_ms: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _PendingTurn:
+    """描述一条待执行或正在执行的用户提交。"""
+
+    turn_id: str
+    prompt: str
+    user_item_key: str
 
 
 class AgentWorkbenchApp(App[None]):
@@ -93,9 +103,12 @@ class AgentWorkbenchApp(App[None]):
         self._items: list[_TimelineItem] = []
         self._item_counter = 0
         self._turn_count = 0
+        self._turn_serial = 0
         self._status_message = "工作台已就绪。"
         self._active_by_kind: dict[str, str] = {}
         self._active_tools: dict[str, str] = {}
+        self._pending_turns: deque[_PendingTurn] = deque()
+        self._active_turn: _PendingTurn | None = None
 
     def compose(self) -> ComposeResult:
         """构建 TUI 布局。"""
@@ -128,10 +141,9 @@ class AgentWorkbenchApp(App[None]):
         event.input.value = ""
         if not prompt:
             return
-        self._append_user_message(prompt)
-        self._start_local_thinking()
-        self._render_timeline()
-        self._run_turn_worker(prompt)
+        self._enqueue_turn(prompt)
+        self._start_next_turn_if_idle()
+        self._refresh_view(force_follow=True)
 
     def action_new_session(self) -> None:
         """清空界面并重置当前 EasyHarness 会话。"""
@@ -144,19 +156,28 @@ class AgentWorkbenchApp(App[None]):
         self._turn_count = 0
         self._active_by_kind.clear()
         self._active_tools.clear()
+        self._pending_turns.clear()
+        self._active_turn = None
         self._status_message = "已创建新会话。"
         self._refresh_view()
 
-    @work(thread=True, exclusive=True, group="agent", exit_on_error=False)
-    def _run_turn_worker(self, prompt: str) -> None:
+    @work(thread=True, group="agent", exit_on_error=False)
+    def _run_turn_worker(self, turn_id: str, prompt: str) -> None:
         """在后台线程中执行一轮流式会话。"""
 
         try:
             for event in self._agent.stream(prompt):
-                self.call_from_thread(self._apply_agent_event, event)
-            self.call_from_thread(self._complete_turn)
+                self.call_from_thread(self._apply_agent_event_for_turn, turn_id, event)
+            self.call_from_thread(self._complete_turn, turn_id)
         except Exception as error:  # pragma: no cover
-            self.call_from_thread(self._show_error, f"处理失败: {error}")
+            self.call_from_thread(self._show_error, turn_id, f"处理失败: {error}")
+
+    def _apply_agent_event_for_turn(self, turn_id: str, event: AgentEvent) -> None:
+        """仅当事件属于当前活跃轮次时，才把它应用到本地展示态。"""
+
+        if not self._is_active_turn(turn_id):
+            return
+        self._apply_agent_event(event)
 
     def _apply_agent_event(self, event: AgentEvent) -> None:
         """把 EasyHarness 事件应用到 TUI 本地展示态。"""
@@ -303,28 +324,46 @@ class AgentWorkbenchApp(App[None]):
             metadata=self._event_data_dict(event),
         )
 
-    def _complete_turn(self) -> None:
+    def _complete_turn(self, turn_id: str) -> None:
         """标记一轮流式会话自然完成。"""
 
+        if not self._is_active_turn(turn_id):
+            return
+        self._settle_running_turn_items("completed")
         self._finalize_provisional_thinking()
         self._turn_count += 1
-        self._status_message = "回复完成。"
-        self._refresh_view()
+        self._finish_active_turn(queue_state="completed", status_message="回复完成。")
 
-    def _show_error(self, message: str) -> None:
+    def _show_error(self, turn_id: str, message: str) -> None:
         """在本地展示态中追加错误消息。"""
 
+        if not self._is_active_turn(turn_id):
+            return
+        self._settle_running_turn_items("failed", message=message)
+        self._finalize_provisional_thinking()
         self._append_item(
             kind="system",
             title="处理失败",
             body=message,
             status="failed",
         )
-        self._status_message = message
-        self._refresh_view(force_follow=True)
+        self._turn_count += 1
+        self._finish_active_turn(queue_state="failed", status_message=message)
 
-    def _append_user_message(self, content: str) -> str:
-        return self._append_item(kind="user", title="你", body=content)
+    def _append_user_message(
+        self,
+        content: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """追加用户消息条目，可附带队列状态元数据。"""
+
+        return self._append_item(
+            kind="user",
+            title="你",
+            body=content,
+            metadata=metadata,
+        )
 
     def _start_local_thinking(self) -> None:
         """在收到真实事件前先启动本地 thinking 占位与计时。"""
@@ -350,6 +389,105 @@ class AgentWorkbenchApp(App[None]):
         item.started_at = None
         item.metadata["provisional"] = False
         self._active_by_kind.pop("thinking", None)
+
+    def _enqueue_turn(self, prompt: str) -> None:
+        """把一条用户提交加入本地执行队列。"""
+
+        turn_id = self._next_turn_id()
+        user_item_key = self._append_user_message(
+            prompt,
+            metadata={
+                "turn_id": turn_id,
+                "queue_state": "queued",
+                "queue_position": 0,
+            },
+        )
+        self._pending_turns.append(
+            _PendingTurn(
+                turn_id=turn_id,
+                prompt=prompt,
+                user_item_key=user_item_key,
+            )
+        )
+        self._refresh_turn_queue_metadata()
+
+    def _start_next_turn_if_idle(self) -> None:
+        """若当前没有活跃轮次，则启动队首消息。"""
+
+        if self._active_turn is not None or not self._pending_turns:
+            return
+        turn = self._pending_turns.popleft()
+        self._active_turn = turn
+        self._refresh_turn_queue_metadata()
+        self._start_local_thinking()
+        self._status_message = "正在处理排队消息。"
+        self._refresh_view(force_follow=True)
+        self._run_turn_worker(turn.turn_id, turn.prompt)
+
+    def _finish_active_turn(self, *, queue_state: str, status_message: str) -> None:
+        """收尾当前活跃轮次，并在可能时启动下一条。"""
+
+        if self._active_turn is None:
+            return
+        item = self._get_item(self._active_turn.user_item_key)
+        if item is not None:
+            item.metadata["queue_state"] = queue_state
+            item.metadata["queue_position"] = None
+            item.status = "failed" if queue_state == "failed" else "completed"
+        self._active_turn = None
+        self._refresh_turn_queue_metadata()
+        self._status_message = status_message
+        self._refresh_view(force_follow=True)
+        self._start_next_turn_if_idle()
+
+    def _refresh_turn_queue_metadata(self) -> None:
+        """同步当前活跃条目与待处理条目的队列状态。"""
+
+        if self._active_turn is not None:
+            active_item = self._get_item(self._active_turn.user_item_key)
+            if active_item is not None:
+                active_item.metadata["queue_state"] = "running"
+                active_item.metadata["queue_position"] = 0
+        for index, turn in enumerate(self._pending_turns, start=1):
+            item = self._get_item(turn.user_item_key)
+            if item is None:
+                continue
+            item.metadata["queue_state"] = "queued"
+            item.metadata["queue_position"] = index
+            item.status = "completed"
+
+    def _settle_running_turn_items(self, status: str, *, message: str = "") -> None:
+        """收口当前仍处于 started 的展示项，避免失败后残留运行态。"""
+
+        for key in list(self._active_by_kind.values()):
+            item = self._get_item(key)
+            if item is None or item.started_at is None:
+                continue
+            self._sync_running_item_duration(item)
+            item.status = status
+            item.started_at = None
+        self._active_by_kind.clear()
+        for key in list(self._active_tools.values()):
+            item = self._get_item(key)
+            if item is None:
+                continue
+            self._sync_running_item_duration(item)
+            item.status = status
+            item.started_at = None
+            if message and "error" not in item.metadata:
+                item.metadata["error"] = message
+        self._active_tools.clear()
+
+    def _is_active_turn(self, turn_id: str) -> bool:
+        """判断某个 turn_id 是否仍对应当前活跃轮次。"""
+
+        return self._active_turn is not None and self._active_turn.turn_id == turn_id
+
+    def _next_turn_id(self) -> str:
+        """生成当前会话内唯一的轮次编号。"""
+
+        self._turn_serial += 1
+        return f"turn-{self._turn_serial}"
 
     def _append_item(
         self,
@@ -476,10 +614,27 @@ class AgentWorkbenchApp(App[None]):
         return self._format_tool_item(item)
 
     def _format_message_item(self, item: _TimelineItem) -> str:
+        if item.kind == "user":
+            return self._format_user_item(item)
         prefix = f"{item.title}:"
         if item.status == "failed":
             prefix = f"{item.title} [失败]:"
         return f"{prefix} {item.body}"
+
+    @staticmethod
+    def _format_user_item(item: _TimelineItem) -> str:
+        """按队列状态渲染用户消息。"""
+
+        queue_state = str(item.metadata.get("queue_state", "")).strip()
+        if queue_state == "running":
+            return f"{item.title} [处理中]: {item.body}"
+        if queue_state == "queued":
+            position = item.metadata.get("queue_position")
+            suffix = f" #{position}" if position else ""
+            return f"{item.title} [排队中{suffix}]: {item.body}"
+        if queue_state == "failed" or item.status == "failed":
+            return f"{item.title} [失败]: {item.body}"
+        return f"{item.title}: {item.body}"
 
     def _format_tool_item(self, item: _TimelineItem) -> str:
         lines = [
