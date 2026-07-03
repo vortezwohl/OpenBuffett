@@ -1,4 +1,4 @@
-"""默认本地 agent 装配入口。
+"""默认 EasyHarness agent 装配入口。
 
 该文件承担应用 composition 层职责：定义默认 system prompt、默认工具集、
 默认模型和默认 agent 组装。TUI、future WebUI 等界面层只消费这里提供的
@@ -9,36 +9,65 @@ from __future__ import annotations
 
 import os
 
-from src.core.agent import Agent
+from easyharness import Agent
+from easyharness.toolset import build_fileglide_tools
+
 from src.service.model_hub import create_default_brain_model
-from src.tool.registry import build_default_tool_registry
+from src.tool.seedream_image import SEEDREAM_IMAGE_TOOL
 
 
 DEFAULT_SYSTEM_PROMPT = """
 你是 SmartIPO 的本地 coding agent。
-- 接到一个任务后要自己连续规划并调用工具，直到任务自然结束。
-- 优先使用 fileglide 完成读取、搜索、写入、移动等本地文件系统操作。
-- 先做范围尽可能小的只读探索，再进入修改。
-- 先读再改，避免无根据猜测。
-- 工具失败时要直接暴露失败，不要伪装成成功。
+- 接到任务后要按可验证的小步骤推进，直到任务自然结束或明确遇到阻塞。
+- 使用 EasyHarness 提供的 fileglide 工具完成本地文件读取、搜索、编辑、移动和检查。
+- 文件修改前先读取必要上下文，避免无根据猜测。
+- 工具失败时直接暴露失败原因，不要伪装成成功。
+- 默认使用中文简体回答用户；工具合同和底层事件语义由 EasyHarness 负责。
 """.strip()
 
+DEFAULT_FILEGLIDE_TOOL_NAMES = (
+    "fileglide_list_tree",
+    "fileglide_search_paths",
+    "fileglide_read_text",
+    "fileglide_search_text",
+    "fileglide_edit_text",
+    "fileglide_manage_paths",
+    "fileglide_inspect_path",
+)
+
+DEFAULT_BUSINESS_TOOL_NAMES = (
+    "generate_seedream_image",
+)
+
 DEFAULT_WORKBENCH_TOOL_NAMES = (
-    "path.list",
-    "file.list",
-    "text.read",
-    "text.grep",
+    *DEFAULT_FILEGLIDE_TOOL_NAMES,
+    *DEFAULT_BUSINESS_TOOL_NAMES,
 )
 
 
-def build_default_agent(event_sink) -> Agent:
-    """构造默认本地主脑控制器。"""
+def build_default_tools(workspace_root: str | None = None) -> list[object]:
+    """构造默认 EasyHarness 工具对象集合。
+
+    Args:
+        workspace_root: 默认文件工具作用域根目录；为空时使用当前工作目录。
+
+    Returns:
+        可直接传入 `easyharness.Agent` 的工具对象列表。
+    """
+
+    root = workspace_root or os.getcwd()
+    return [
+        *build_fileglide_tools(default_root=root),
+        SEEDREAM_IMAGE_TOOL,
+    ]
+
+
+def build_default_agent(workspace_root: str | None = None) -> Agent:
+    """构造默认 EasyHarness 本地 agent。"""
 
     return Agent(
         model=create_default_brain_model(),
-        tool_registry=build_default_tool_registry(),
         system_prompt=DEFAULT_SYSTEM_PROMPT,
-        tool_names=DEFAULT_WORKBENCH_TOOL_NAMES,
-        event_sink=event_sink,
-        workspace_root=os.getcwd(),
+        tools=build_default_tools(workspace_root),
+        enable_fileglide=False,
     )

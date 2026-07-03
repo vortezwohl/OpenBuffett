@@ -1,36 +1,50 @@
-"""基于 Textual 的本地 agent workbench。
+"""基于 Textual 的 EasyHarness 本地 agent 工作台。
 
-该文件只负责界面层：单会话输入、时间线渲染、流式 assistant 输出，以及
-运行中活动的本地动画表现。事件解释和时间线归约统一由 core timeline 层承担。
+该文件只负责界面层：接收用户输入、消费 `easyharness.AgentEvent` 流、
+维护本地展示态并渲染单列会话记录。运行时、工具合同和事件事实来源均由
+EasyHarness 提供，本文件不得重新定义跨 UI 共享的 runtime 或 timeline 协议。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
+from easyharness import AgentEvent
 from rich.text import Text
 from textual import work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Footer, Header, Input, Static
 
-from src.app.default_agent import (
-    DEFAULT_SYSTEM_PROMPT,
-    DEFAULT_WORKBENCH_TOOL_NAMES,
-    build_default_agent,
-)
-from src.core.events import LoopEvent, TOOL_ACTIVITY_EVENT_TYPES
-from src.core.timeline import ConversationTimeline, TimelineEntry
+from src.app.default_agent import build_default_agent
 
-_MIN_TOOL_VISIBLE_MS = 200
-_TIMELINE_REFRESH_INTERVAL_SECONDS = 0.01
+_TIMELINE_REFRESH_INTERVAL_SECONDS = 0.05
 _THINKING_ANIMATION_FRAME_MS = 150
 
 
+@dataclass(slots=True)
+class _TimelineItem:
+    """TUI 本地展示项，不作为跨层运行时合同导出。"""
+
+    key: str
+    kind: str
+    title: str
+    body: str = ""
+    status: str = "completed"
+    name: str = ""
+    preview: str = ""
+    detail: str = ""
+    started_at: datetime | None = None
+    duration_ms: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 class AgentWorkbenchApp(App[None]):
-    """运行 SmartIPO 本地 agent 的单列时间线工作台。"""
+    """运行 SmartIPO EasyHarness agent 的单列本地工作台。"""
 
     CSS = """
     Screen {
@@ -67,15 +81,21 @@ class AgentWorkbenchApp(App[None]):
         Binding("ctrl+n", "new_session", "新会话"),
     ]
 
-    def __init__(self, *, session_loop: Any | None = None) -> None:
-        """初始化工作台。"""
+    def __init__(self, *, agent: Any | None = None) -> None:
+        """初始化工作台。
+
+        Args:
+            agent: 可选 EasyHarness agent 兼容对象；测试可注入假对象。
+        """
 
         super().__init__()
-        self._timeline = ConversationTimeline()
+        self._agent = agent or build_default_agent()
+        self._items: list[_TimelineItem] = []
+        self._item_counter = 0
+        self._turn_count = 0
         self._status_message = "工作台已就绪。"
-        self._session_loop = session_loop or build_default_agent(
-            self._dispatch_runtime_event
-        )
+        self._active_by_kind: dict[str, str] = {}
+        self._active_tools: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         """构建 TUI 布局。"""
@@ -86,181 +106,344 @@ class AgentWorkbenchApp(App[None]):
             with VerticalScroll(id="timeline-scroll"):
                 yield Static(id="timeline-view")
             yield Input(
-                placeholder="输入一个任务，agent 会自行调用工具完成。",
+                placeholder="输入一个任务，agent 会通过 EasyHarness 工具流完成。",
                 id="chat-input",
             )
         yield Footer()
 
     def on_mount(self) -> None:
-        """挂载后刷新界面并开始计时。"""
+        """挂载后刷新界面并启动本地运行态计时。"""
 
         self._refresh_view()
         self.set_interval(
             _TIMELINE_REFRESH_INTERVAL_SECONDS,
-            self._refresh_running_timeline,
+            self._refresh_running_items,
         )
         self.call_after_refresh(self._focus_chat_input)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """把输入框内容提交给会话 loop。"""
+        """把输入框内容提交给 EasyHarness agent。"""
 
         prompt = event.value.strip()
         event.input.value = ""
         if not prompt:
             return
-        self._timeline.append_user_message(prompt)
+        self._append_user_message(prompt)
         self._render_timeline()
         self._run_turn_worker(prompt)
 
     def action_new_session(self) -> None:
-        """清空界面并重建当前内存会话。"""
+        """清空界面并重置当前 EasyHarness 会话。"""
 
-        self._session_loop.reset()
-        self._timeline.reset()
+        reset = getattr(self._agent, "reset", None)
+        if callable(reset):
+            reset()
+        self._items = []
+        self._item_counter = 0
+        self._turn_count = 0
+        self._active_by_kind.clear()
+        self._active_tools.clear()
         self._status_message = "已创建新会话。"
         self._refresh_view()
 
     @work(thread=True, exclusive=True, group="agent", exit_on_error=False)
     def _run_turn_worker(self, prompt: str) -> None:
-        """在后台线程中执行一轮会话。"""
+        """在后台线程中执行一轮流式会话。"""
 
         try:
-            self._session_loop.run(prompt)
+            for event in self._agent.stream(prompt):
+                self.call_from_thread(self._apply_agent_event, event)
+            self.call_from_thread(self._complete_turn)
         except Exception as error:  # pragma: no cover
             self.call_from_thread(self._show_error, f"处理失败: {error}")
 
-    def _dispatch_runtime_event(self, event: LoopEvent) -> None:
-        """把后台线程事件桥接回 Textual 主线程。"""
+    def _apply_agent_event(self, event: AgentEvent) -> None:
+        """把 EasyHarness 事件应用到 TUI 本地展示态。"""
 
-        self.call_from_thread(self._apply_loop_event, event)
+        if event.kind == "thinking":
+            self._apply_thinking_event(event)
+        elif event.kind == "tool":
+            self._apply_tool_event(event)
+        elif event.kind == "assistant":
+            self._apply_assistant_event(event)
+        elif event.kind == "system":
+            self._apply_system_event(event)
+        elif event.kind == "compress":
+            self._apply_compress_event(event)
+        self._status_message = self._format_event_status(event)
+        self._refresh_view()
 
-    def _apply_loop_event(self, event: LoopEvent) -> None:
-        """把一条运行时事件应用到时间线。"""
+    def _apply_thinking_event(self, event: AgentEvent) -> None:
+        if event.status == "started":
+            self._active_by_kind["thinking"] = self._append_item(
+                kind="thinking",
+                title="AI",
+                body=event.text or "thinking",
+                status="started",
+                started_at=self._parse_started_at(event.started_at),
+            )
+            return
+        key = self._active_by_kind.get("thinking", "")
+        item = self._get_item(key)
+        if item is None:
+            return
+        if event.status == "delta" and event.text:
+            item.body += event.text
+            return
+        if event.status in {"completed", "failed"}:
+            if event.text:
+                item.body = event.text
+            item.status = event.status
+            item.duration_ms = event.duration_ms or item.duration_ms
+            item.started_at = None
+            self._active_by_kind.pop("thinking", None)
 
-        channel = event.channel
-        event_type = event.event_type
-        payload = event.payload
-        if (
-            channel == "progress"
-            and event_type in {"tool_completed", "tool_failed"}
-            and self._should_defer_tool_event(event)
-        ):
-            delay = self._tool_delay_seconds(event)
-            if delay > 0:
-                self.set_timer(delay, lambda: self._apply_tool_terminal_event(event))
-                return
-        self._timeline.apply_event(event)
-        if channel == "assistant" and event_type == "assistant_stream_started":
-            self._status_message = payload.get("message", "正在生成回复。")
-            self._refresh_view()
+    def _apply_tool_event(self, event: AgentEvent) -> None:
+        tool_key = self._tool_event_key(event)
+        if event.status == "started":
+            self._active_tools[tool_key] = self._append_item(
+                kind="tool",
+                title="",
+                body="",
+                name=event.name or "tool",
+                status="started",
+                started_at=self._parse_started_at(event.started_at),
+                metadata=self._event_data_dict(event),
+            )
             return
-        if channel == "assistant" and event_type == "assistant_stream_delta":
-            self._render_timeline()
+        item = self._get_item(self._active_tools.get(tool_key, ""))
+        if item is None:
+            key = self._append_item(
+                kind="tool",
+                title="",
+                body="",
+                name=event.name or "tool",
+                status=event.status,
+                metadata=self._event_data_dict(event),
+            )
+            item = self._get_item(key)
+        if item is None:
             return
-        if channel == "assistant" and event_type == "assistant_stream_completed":
-            self._status_message = "回复完成。"
-            self._refresh_view()
+        item.status = event.status
+        item.duration_ms = event.duration_ms or item.duration_ms
+        item.started_at = None
+        item.metadata.update(self._event_data_dict(event))
+        output = self._extract_tool_output(event)
+        item.preview = output.get("preview") or event.text or item.preview
+        item.detail = output.get("detail") or output.get("model_text") or item.detail
+        if event.text and not item.preview:
+            item.preview = event.text
+        if event.status in {"completed", "failed"}:
+            self._active_tools.pop(tool_key, None)
+
+    def _apply_assistant_event(self, event: AgentEvent) -> None:
+        if event.status == "started":
+            self._active_by_kind["assistant"] = self._append_item(
+                kind="assistant",
+                title="AI",
+                status="started",
+                started_at=self._parse_started_at(event.started_at),
+            )
             return
-        if channel == "assistant" and event_type == "assistant_stream_failed":
-            self._show_error(str(payload.get("message", "回复失败。")))
+        item = self._get_item(self._active_by_kind.get("assistant", ""))
+        if item is None and event.text:
+            key = self._append_item(
+                kind="assistant",
+                title="AI",
+                body="",
+                status=event.status,
+                started_at=self._parse_started_at(event.started_at),
+            )
+            item = self._get_item(key)
+            self._active_by_kind["assistant"] = key
+        if item is None:
             return
-        if channel == "progress" and event_type == "thinking_started":
-            self._status_message = "thinking"
-            self._refresh_view()
+        if event.status == "delta" and event.text:
+            item.body += event.text
             return
-        if channel == "progress" and event_type == "thinking_completed":
-            self._render_timeline()
-            return
-        if channel == "progress" and event_type == "thinking_failed":
-            self._status_message = str(payload.get("message", "思考失败。"))
-            self._refresh_view()
-            return
-        if channel == "progress" and event_type in TOOL_ACTIVITY_EVENT_TYPES:
-            self._status_message = self._format_tool_status(event_type, payload)
-            self._refresh_view()
+        if event.status in {"completed", "failed"}:
+            if event.text:
+                item.body = event.text
+            item.status = event.status
+            item.duration_ms = event.duration_ms or item.duration_ms
+            item.started_at = None
+            self._active_by_kind.pop("assistant", None)
+
+    def _apply_system_event(self, event: AgentEvent) -> None:
+        self._append_item(
+            kind="system",
+            title="系统",
+            body=event.text or "",
+            status=event.status,
+            started_at=self._parse_started_at(event.started_at),
+            duration_ms=event.duration_ms or 0,
+            metadata=self._event_data_dict(event),
+        )
+
+    def _apply_compress_event(self, event: AgentEvent) -> None:
+        self._append_item(
+            kind="compress",
+            title="上下文压缩",
+            body=event.text or "",
+            status=event.status,
+            started_at=self._parse_started_at(event.started_at),
+            duration_ms=event.duration_ms or 0,
+            metadata=self._event_data_dict(event),
+        )
+
+    def _complete_turn(self) -> None:
+        """标记一轮流式会话自然完成。"""
+
+        self._turn_count += 1
+        self._status_message = "回复完成。"
+        self._refresh_view()
 
     def _show_error(self, message: str) -> None:
-        """在时间线中展示错误。"""
+        """在本地展示态中追加错误消息。"""
 
-        self._timeline.append_system_message("处理失败", message, status="error")
+        self._append_item(
+            kind="system",
+            title="处理失败",
+            body=message,
+            status="failed",
+        )
         self._status_message = message
         self._refresh_view()
 
+    def _append_user_message(self, content: str) -> str:
+        return self._append_item(kind="user", title="你", body=content)
+
+    def _append_item(
+        self,
+        *,
+        kind: str,
+        title: str,
+        body: str = "",
+        status: str = "completed",
+        name: str = "",
+        preview: str = "",
+        detail: str = "",
+        started_at: datetime | None = None,
+        duration_ms: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        self._item_counter += 1
+        key = f"{kind}-{self._item_counter}"
+        self._items.append(
+            _TimelineItem(
+                key=key,
+                kind=kind,
+                title=title,
+                body=body,
+                status=status,
+                name=name,
+                preview=preview,
+                detail=detail,
+                started_at=started_at,
+                duration_ms=duration_ms,
+                metadata=metadata or {},
+            )
+        )
+        return key
+
+    def _get_item(self, key: str) -> _TimelineItem | None:
+        for item in self._items:
+            if item.key == key:
+                return item
+        return None
+
+    def _refresh_running_items(self) -> None:
+        """刷新仍处于 started 状态的本地展示时长。"""
+
+        changed = False
+        now = datetime.now()
+        for item in self._items:
+            if item.started_at is None:
+                continue
+            duration_ms = int((now - item.started_at).total_seconds() * 1000)
+            duration_ms = max(0, duration_ms)
+            if duration_ms != item.duration_ms:
+                item.duration_ms = duration_ms
+                changed = True
+        if changed:
+            self._render_timeline()
+
+    def _refresh_view(self) -> None:
+        """刷新顶部状态和会话记录。"""
+
+        try:
+            self.query_one("#status-banner", Static).update(
+                Text(self._render_status_banner())
+            )
+        except (NoMatches, ScreenStackError):
+            return
+        self._render_timeline()
+
     def _render_timeline(self) -> None:
-        """刷新主时间线区域。"""
+        """刷新主会话记录区域。"""
 
         try:
             timeline_widget = self.query_one("#timeline-view", Static)
             scroll_widget = self.query_one("#timeline-scroll", VerticalScroll)
-        except NoMatches:
+        except (NoMatches, ScreenStackError):
             return
         should_follow = self._should_follow_scroll(scroll_widget)
         timeline_widget.update(Text(self._render_timeline_text()))
         if should_follow:
             scroll_widget.scroll_end(animate=False)
 
-    def _refresh_running_timeline(self) -> None:
-        """刷新仍在运行中的计时项目。"""
-
-        if self._timeline.refresh_running_durations():
-            self._render_timeline()
-
-    def _refresh_view(self) -> None:
-        """刷新顶部状态和时间线。"""
-
-        try:
-            self.query_one("#status-banner", Static).update(Text(self._render_status_banner()))
-        except NoMatches:
-            return
-        self._render_timeline()
-
     def _render_status_banner(self) -> str:
         """渲染顶部状态摘要。"""
 
-        turn_count = len(getattr(self._session_loop, "history", ())) // 2
         return (
-            "[SmartIPO Agent Workbench]\n"
-            f"turns: {turn_count}\n"
+            "[SmartIPO EasyHarness Workbench]\n"
+            f"turns: {self._turn_count}\n"
             f"status: {self._status_message}"
         )
 
     def _render_timeline_text(self) -> str:
-        """把时间线项目渲染为文本。"""
+        """把本地展示项渲染为文本。"""
 
-        entries = self._timeline.entries
-        if not entries:
+        if not self._items:
             return "还没有消息。"
-        return "\n\n".join(self._format_timeline_item(item) for item in entries)
+        return "\n\n".join(self._format_timeline_item(item) for item in self._items)
 
-    def _format_timeline_item(self, item: TimelineEntry) -> str:
-        """把一条时间线项目格式化为可读文本。"""
-
-        if item.kind in {"user", "assistant", "system"}:
-            return f"{item.title}: {item.body}"
+    def _format_timeline_item(self, item: _TimelineItem) -> str:
+        if item.kind in {"user", "assistant", "system", "compress"}:
+            return self._format_message_item(item)
         if item.kind == "thinking":
             return (
-                f"{self._format_duration(item.visible_duration_ms)} | "
+                f"{self._format_duration(item.duration_ms)} | "
                 f"{item.title}: {self._thinking_label(item)}"
             )
-        header = (
-            f"{self._format_duration(item.visible_duration_ms)} | "
-            f"{self._format_tool_label(item)} | "
-            f"{self._format_status_label(item.status)}"
-        )
-        lines = [header]
-        phase = self._format_tool_phase(item)
-        if phase:
-            lines.append(f"阶段: {phase}")
+        return self._format_tool_item(item)
+
+    def _format_message_item(self, item: _TimelineItem) -> str:
+        prefix = f"{item.title}:"
+        if item.status == "failed":
+            prefix = f"{item.title} [失败]:"
+        return f"{prefix} {item.body}"
+
+    def _format_tool_item(self, item: _TimelineItem) -> str:
+        lines = [
+            (
+                f"{self._format_duration(item.duration_ms)} | "
+                f"{item.name or 'tool'} | "
+                f"{self._format_status_label(item.status)}"
+            )
+        ]
+        tool_use_id = self._tool_use_id_from_metadata(item.metadata)
+        if tool_use_id:
+            lines.append(f"调用: {tool_use_id}")
         error = str(item.metadata.get("error", "")).strip()
+        if item.status == "failed" and not error:
+            error = item.preview or item.body
         if error:
             lines.append(f"错误: {error}")
         if item.preview:
             lines.append(f"概要: {item.preview}")
-        if item.detail:
-            if item.collapsible and item.collapsed:
-                lines.append("结果: [详细结果已收起]")
-            elif item.detail != item.preview or not item.preview:
-                lines.append(f"结果: {item.detail}")
+        if item.detail and item.detail != item.preview:
+            lines.append(f"结果: {item.detail}")
         return "\n".join(lines)
 
     def _focus_chat_input(self) -> None:
@@ -268,110 +451,95 @@ class AgentWorkbenchApp(App[None]):
 
         self.query_one("#chat-input", Input).focus()
 
-    def _apply_tool_terminal_event(self, event: LoopEvent) -> None:
-        """在最小可见时长满足后应用工具结束事件。"""
-
-        self._timeline.apply_event(event)
-        self._status_message = self._format_tool_status(
-            event.event_type,
-            event.payload,
-        )
-        self._refresh_view()
-
-    def _should_defer_tool_event(self, event: LoopEvent) -> bool:
-        """判断某条工具结束事件是否需要延后，以保证运行态可见。"""
-
-        return self._tool_delay_seconds(event) > 0
-
-    def _tool_delay_seconds(self, event: LoopEvent) -> float:
-        """计算工具结束事件还需延后的秒数。"""
-
-        tool_name = str(event.payload.get("tool_name", "")).strip()
-        if not tool_name:
-            return 0.0
-        entry = self._find_running_tool_entry(tool_name)
-        if entry is None:
-            return 0.0
-        elapsed_ms = entry.visible_duration_ms
-        if entry.started_at is not None and elapsed_ms <= 0:
-            self._timeline.refresh_running_durations()
-            elapsed_ms = entry.visible_duration_ms
-        remaining_ms = _MIN_TOOL_VISIBLE_MS - elapsed_ms
-        if remaining_ms <= 0:
-            return 0.0
-        return remaining_ms / 1000
-
-    def _find_running_tool_entry(self, tool_name: str) -> TimelineEntry | None:
-        """按原始工具名查找仍在运行中的工具条目。"""
-
-        for item in self._timeline.entries:
-            if item.kind != "tool" or item.status != "running":
-                continue
-            if str(item.metadata.get("tool_name", "")) == tool_name:
-                return item
-        return None
-
     @staticmethod
     def _format_status_label(status: str) -> str:
-        """把内部状态映射为用户可读文案。"""
-
-        if status == "running":
+        if status == "started":
             return "进行中"
-        if status == "error":
+        if status == "delta":
+            return "更新中"
+        if status == "failed":
             return "失败"
         return "完成"
 
     @staticmethod
     def _format_duration(duration_ms: int) -> str:
-        """把毫秒时长格式化为秒。"""
-
         return f"{duration_ms / 1000:.2f}s"
 
     @staticmethod
-    def _thinking_label(item: TimelineEntry) -> str:
-        """把 thinking 基础文本渲染为本地动画。"""
-
-        if item.status != "running":
+    def _thinking_label(item: _TimelineItem) -> str:
+        if item.status != "started":
             return item.body
-        cycle = (item.visible_duration_ms // _THINKING_ANIMATION_FRAME_MS) % 3
+        cycle = (item.duration_ms // _THINKING_ANIMATION_FRAME_MS) % 3
         suffix = (".", "..", "...")[cycle]
-        return f"{item.body} {suffix}"
+        return f"{item.body or 'thinking'} {suffix}"
 
     @staticmethod
-    def _format_tool_label(item: TimelineEntry) -> str:
-        """基于原始语义字段渲染工具条目标识。"""
-
-        tool_name = str(item.metadata.get("tool_name", "tool")).strip() or "tool"
-        tool_kind = str(item.metadata.get("tool_kind", "")).strip()
-        if not tool_kind:
-            return tool_name
-        return f"{tool_name} [{tool_kind}]"
-
-    @staticmethod
-    def _format_tool_status(event_type: str, payload: dict[str, Any]) -> str:
-        """基于原始语义字段生成顶部状态文案。"""
-
-        tool_name = str(payload.get("tool_name", "tool")).strip() or "tool"
-        if event_type == "tool_attempt_started":
-            return f"尝试工具: {tool_name}"
-        if event_type == "tool_started":
-            return f"调用工具: {tool_name}"
-        if event_type == "tool_attempt_failed":
-            return f"工具尝试失败: {tool_name}"
-        if event_type == "tool_failed":
-            return f"工具失败: {tool_name}"
-        return f"工具完成: {tool_name}"
+    def _parse_started_at(value: str | None) -> datetime | None:
+        if not value:
+            return datetime.now()
+        try:
+            normalized = value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            return parsed.replace(tzinfo=None)
+        except ValueError:
+            return datetime.now()
 
     @staticmethod
-    def _format_tool_phase(item: TimelineEntry) -> str:
-        """渲染工具当前阶段。"""
+    def _event_data_dict(event: AgentEvent) -> dict[str, Any]:
+        if isinstance(event.data, dict):
+            return dict(event.data)
+        if event.data is None:
+            return {}
+        return {"data": event.data}
 
-        phase = str(item.metadata.get("phase", "")).strip()
-        if phase == "attempt":
-            return "调用尝试"
-        if phase == "execution":
-            return "本地执行"
-        return ""
+    @staticmethod
+    def _extract_tool_output(event: AgentEvent) -> dict[str, Any]:
+        data = AgentWorkbenchApp._event_data_dict(event)
+        output = data.get("output")
+        if isinstance(output, dict):
+            return {
+                "preview": str(output.get("preview") or "").strip(),
+                "detail": str(output.get("detail") or "").strip(),
+                "model_text": str(output.get("model_text") or "").strip(),
+            }
+        return {}
+
+    @staticmethod
+    def _tool_event_key(event: AgentEvent) -> str:
+        data = AgentWorkbenchApp._event_data_dict(event)
+        tool_use_id = str(data.get("tool_use_id", "")).strip()
+        return tool_use_id or event.name or "tool"
+
+    @staticmethod
+    def _tool_use_id_from_metadata(metadata: dict[str, Any]) -> str:
+        return str(metadata.get("tool_use_id", "")).strip()
+
+    @staticmethod
+    def _format_event_status(event: AgentEvent) -> str:
+        if event.kind == "thinking":
+            if event.status == "started":
+                return "thinking"
+            if event.status == "failed":
+                return event.text or "思考失败。"
+            return "思考完成。"
+        if event.kind == "assistant":
+            if event.status == "started":
+                return "正在生成回复。"
+            if event.status == "delta":
+                return "正在生成回复。"
+            if event.status == "failed":
+                return event.text or "回复失败。"
+            return "回复完成。"
+        if event.kind == "tool":
+            name = event.name or "tool"
+            if event.status == "started":
+                return f"调用工具: {name}"
+            if event.status == "failed":
+                return f"工具失败: {name}"
+            return f"工具完成: {name}"
+        if event.kind == "compress":
+            return "上下文压缩。"
+        return event.text or "系统事件。"
 
     @staticmethod
     def _should_follow_scroll(scroll_widget: VerticalScroll) -> bool:

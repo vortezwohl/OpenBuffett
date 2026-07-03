@@ -1,13 +1,11 @@
-"""主脑可调用工具集合。
+"""SmartIPO 业务工具集合。
 
-该包负责定义项目内业务能力的统一 tool 契约与注册入口。当前默认接入
-完整 fileglide 本地文件系统工具集，以及现有 Seedream 生图能力。
+该包只导出项目自定义业务工具对象。文件系统工具由 EasyHarness 官方
+fileglide toolset 提供，业务工具使用 `easyharness.tool` 公共合同声明。
 """
 
-from src.tool.fileglide_tools import build_fileglide_tool_specs
-from src.tool.seedream_image import TOOL_SPEC as SEEDREAM_IMAGE_TOOL_SPEC
+from src.tool.seedream_image import SEEDREAM_IMAGE_TOOL
 
 __all__ = [
-    "build_fileglide_tool_specs",
-    "SEEDREAM_IMAGE_TOOL_SPEC",
+    "SEEDREAM_IMAGE_TOOL",
 ]

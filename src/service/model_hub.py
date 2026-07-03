@@ -1,7 +1,8 @@
-"""主脑模型配置解析与装配入口。
+"""主脑模型配置解析与 EasyHarness 装配入口。
 
-该文件把 `src/model_config.py` 中的静态配置解析为 strands 可直接使用的
-`LiteLLMModel`，并集中处理环境变量读取与采样参数覆写保护。
+该文件把 `src/model_config.py` 中的静态配置解析为 `easyharness.ModelConfig`。
+它只负责读取项目集中配置、解析环境变量和保护采样参数不被调用点绕过，
+不再构造 strands 私有模型对象，也不承担 agent runtime 调度职责。
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import os
 from typing import Any
 
 from dotenv import load_dotenv
-from strands.models.litellm import LiteLLMModel
+from easyharness import ModelConfig
 
 from src.model_config import (
     AGENT_SESSION_ROUND,
@@ -24,39 +25,33 @@ load_dotenv()
 
 
 class ModelHub:
-    """按调用点名称装配主脑模型。"""
+    """按调用点名称装配 EasyHarness 主脑模型配置。"""
 
     def get_brain_model(
         self,
         call_name: str = AGENT_SESSION_ROUND,
         **overrides: Any,
-    ) -> LiteLLMModel:
-        """返回一个绑定了集中采样参数的主脑模型。
+    ) -> ModelConfig:
+        """返回一个绑定集中采样参数的 EasyHarness 模型配置。
 
         Args:
             call_name: 主脑调用点名称。
             **overrides: 预留给未来非采样类扩展；采样参数覆写会被拒绝。
 
         Returns:
-            strands 可直接使用的 `LiteLLMModel`。
+            EasyHarness 可直接使用的 `ModelConfig`。
         """
 
         _reject_sampling_overrides(overrides)
         config = _get_brain_model_config(call_name)
         channel = _get_channel_config(config.channel)
-        params: dict[str, Any] = {
-            "temperature": config.temperature,
-            "top_p": config.top_p,
-        }
-        if config.seed is not None:
-            params["seed"] = config.seed
-        return LiteLLMModel(
-            model_id=f"{channel.provider}/{config.model}",
-            client_args={
-                "api_key": _resolve_api_key(channel, call_name),
-                "api_base": _resolve_api_base(channel),
-            },
-            params=params,
+        return ModelConfig(
+            model=f"{channel.provider}/{config.model}",
+            api_key=_resolve_api_key(channel, call_name),
+            base_url=_resolve_api_base(channel),
+            temperature=config.temperature,
+            top_p=config.top_p,
+            seed=config.seed,
         )
 
 
@@ -69,8 +64,8 @@ def create_default_model_hub() -> ModelHub:
 def create_default_brain_model(
     call_name: str = AGENT_SESSION_ROUND,
     **overrides: Any,
-) -> LiteLLMModel:
-    """创建默认主脑模型。"""
+) -> ModelConfig:
+    """创建默认主脑模型配置。"""
 
     return create_default_model_hub().get_brain_model(
         call_name=call_name,
