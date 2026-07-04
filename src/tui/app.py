@@ -92,7 +92,7 @@ class _PendingTurn:
 
     turn_id: str
     prompt: str
-    user_item_key: str
+    user_item_key: str = ""
 
 
 @dataclass(slots=True)
@@ -914,22 +914,12 @@ class AgentWorkbenchApp(App[None]):
         """把一条用户提交加入本地执行队列。"""
 
         turn_id = self._next_turn_id()
-        user_item_key = self._append_user_message(
-            prompt,
-            metadata={
-                "turn_id": turn_id,
-                "queue_state": "queued",
-                "queue_position": 0,
-            },
-        )
         self._pending_turns.append(
             _PendingTurn(
                 turn_id=turn_id,
                 prompt=prompt,
-                user_item_key=user_item_key,
             )
         )
-        self._refresh_turn_queue_metadata()
 
     def _start_next_turn_if_idle(self) -> None:
         """若当前没有活跃轮次，则启动队首消息。"""
@@ -942,6 +932,14 @@ class AgentWorkbenchApp(App[None]):
         self._raw_stream_done_turn_id = None
         self._stopping_turn_id = None
         self._cancelled_turn_id = None
+        turn.user_item_key = self._append_user_message(
+            turn.prompt,
+            metadata={
+                "turn_id": turn.turn_id,
+                "queue_state": "running",
+                "queue_position": 0,
+            },
+        )
         self._refresh_turn_queue_metadata()
         self._start_local_thinking(enforce_min_visibility=True)
         self._status_message = "Processing queued message."
@@ -1026,13 +1024,6 @@ class AgentWorkbenchApp(App[None]):
             if active_item is not None:
                 active_item.metadata["queue_state"] = "running"
                 active_item.metadata["queue_position"] = 0
-        for index, turn in enumerate(self._pending_turns, start=1):
-            item = self._get_item(turn.user_item_key)
-            if item is None:
-                continue
-            item.metadata["queue_state"] = "queued"
-            item.metadata["queue_position"] = index
-            item.status = "completed"
 
     def _settle_running_turn_items(self, status: str, *, message: str = "") -> None:
         """收口当前仍处于 started 的展示项，避免失败后残留运行态。"""
@@ -1655,15 +1646,7 @@ class AgentWorkbenchApp(App[None]):
         """返回当前应在 timeline 中可见的展示项。"""
 
         return [
-            item
-            for item in self._items
-            if not (
-                (
-                    item.kind == "user"
-                    and str(item.metadata.get("queue_state", "")).strip() == "queued"
-                )
-                or self._should_hide_timeline_item(item)
-            )
+            item for item in self._items if not self._should_hide_timeline_item(item)
         ]
 
     def _render_queue_tray_text(self) -> str:

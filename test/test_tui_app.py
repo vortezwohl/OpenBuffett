@@ -233,6 +233,25 @@ async def _wait_for_all_turns_to_finish(
     raise AssertionError("Timed out waiting for all turns to finish.")
 
 
+async def _wait_for_timeline_text(
+    pilot,
+    app: AgentWorkbenchApp,
+    expected_text: str,
+    *,
+    timeout_seconds: float = 2.0,
+    pause_seconds: float = 0.05,
+) -> str:
+    """等待指定文本出现在 timeline 中，并返回命中时的完整文本。"""
+
+    deadline = time.perf_counter() + timeout_seconds
+    while time.perf_counter() < deadline:
+        text = app._render_timeline_text()
+        if expected_text in text:
+            return text
+        await pilot.pause(pause_seconds)
+    raise AssertionError(f"Timed out waiting for timeline text: {expected_text}")
+
+
 def _activate_manual_turn(
     app: AgentWorkbenchApp,
     *,
@@ -258,6 +277,13 @@ def _advance_display_ticks(app: AgentWorkbenchApp, ticks: int) -> None:
 
     for _ in range(ticks):
         app._refresh_running_items()
+
+
+def _clear_opening_history(app: AgentWorkbenchApp) -> None:
+    """清理启动欢迎消息，避免其 reveal 过程干扰队列切换测试。"""
+
+    app._items = []
+    app._item_counter = 0
 
 
 class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
@@ -493,6 +519,8 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test() as pilot:
             input_widget = app.query_one("#chat-input", Input)
+            _clear_opening_history(app)
+            app._refresh_view(force_follow=True)
             for prompt in ("第一条", "第二条", "第三条"):
                 fake_event = type(
                     "FakeSubmittedEvent",
@@ -506,6 +534,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             queue_text = app._render_queue_tray_text()
             queue_renderable = app._render_queue_tray_renderable()
             queue_visible_during_wait = queue_widget.display
+            handoff_text = await _wait_for_timeline_text(pilot, app, "User > 第二条")
             await _wait_for_all_turns_to_finish(pilot, app)
             final_text = app._render_timeline_text()
             final_queue_text = app._render_queue_tray_text()
@@ -523,11 +552,25 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(queue_renderable.renderables[0].renderable.plain, "Queued")
-        self.assertIn("第二条", queue_text)
-        self.assertIn("第三条", queue_text)
+        self.assertEqual(queue_text.splitlines(), ["第二条", "第三条"])
+        self.assertIn("User > 第二条", handoff_text)
+        self.assertLess(
+            handoff_text.index("Assistant > 第一条完成"),
+            handoff_text.index("User > 第二条"),
+        )
         self.assertIn("Assistant > 第一条完成", final_text)
+        self.assertIn("User > 第二条", final_text)
+        self.assertIn("User > 第三条", final_text)
         self.assertIn("Assistant > 第二条完成", final_text)
         self.assertIn("Assistant > 第三条完成", final_text)
+        self.assertLess(
+            final_text.index("User > 第二条"),
+            final_text.index("Assistant > 第二条完成"),
+        )
+        self.assertLess(
+            final_text.index("User > 第三条"),
+            final_text.index("Assistant > 第三条完成"),
+        )
         self.assertEqual(final_queue_text, "")
         self.assertFalse(final_queue_visible)
 
@@ -548,6 +591,8 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test() as pilot:
             input_widget = app.query_one("#chat-input", Input)
+            _clear_opening_history(app)
+            app._refresh_view(force_follow=True)
             for prompt in ("第一条", "第二条"):
                 fake_event = type(
                     "FakeSubmittedEvent",
@@ -560,6 +605,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.prompts, ["第一条", "第二条"])
         self.assertIn("User > 第一条", text)
+        self.assertIn("User > 第二条", text)
         self.assertIn("Request failed: boom", text)
         self.assertIn("Assistant > 第二条完成", text)
 
@@ -1696,6 +1742,8 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test() as pilot:
             input_widget = app.query_one("#chat-input", Input)
+            _clear_opening_history(app)
+            app._refresh_view(force_follow=True)
             for prompt in ("第一条", "第二条"):
                 app.on_input_submitted(
                     type(
@@ -1723,6 +1771,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.prompts, ["第一条", "第二条"])
         self.assertIn(f"{DEFAULT_AGENT_BRAND} · Interrupted.", text)
+        self.assertIn("User > 第二条", text)
         self.assertIn("Assistant > 第二条完成", text)
         self.assertNotIn("旧输出", text)
 
@@ -1753,10 +1802,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         agent = _FakeStreamingAgent([])
         app = AgentWorkbenchApp(agent=agent)
-        app._enqueue_turn("旧消息")
-        app._active_turn = app._pending_turns.popleft()
-        app._refresh_turn_queue_metadata()
-        old_turn_id = app._active_turn.turn_id  # type: ignore[union-attr]
+        old_turn_id = _activate_manual_turn(app, prompt="旧消息")
 
         async with app.run_test() as pilot:
             input_widget = app.query_one("#chat-input", Input)
@@ -1766,28 +1812,24 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 {"input": input_widget, "value": "/new"},
             )()
             app.on_input_submitted(fake_event)
-            await pilot.pause(0.1)
+            await _wait_for_timeline_text(pilot, app, "Assistant > 我是 OpenBuffett")
 
         app._apply_agent_event_for_turn(
             old_turn_id,
             AgentEvent(kind="assistant", status="delta", text="旧输出"),
         )
 
+        text = app._render_timeline_text()
         self.assertEqual(agent.reset_count, 1)
-        self.assertEqual(
-            app._render_timeline_text(),
-            f"Assistant > {DEFAULT_OPENING_MESSAGE}",
-        )
+        self.assertTrue(text.startswith("Assistant > 我是 OpenBuffett"))
+        self.assertNotIn("旧输出", text)
         self.assertEqual(app._render_queue_tray_text(), "")
 
     def test_stale_turn_event_is_ignored_after_new_session(self) -> None:
         """新会话后到达的旧轮次事件不应污染当前界面。"""
 
         app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
-        app._enqueue_turn("旧消息")
-        app._active_turn = app._pending_turns.popleft()
-        app._refresh_turn_queue_metadata()
-        old_turn_id = app._active_turn.turn_id  # type: ignore[union-attr]
+        old_turn_id = _activate_manual_turn(app, prompt="旧消息")
 
         app.action_new_session()
         app._apply_agent_event_for_turn(
@@ -1795,10 +1837,11 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             AgentEvent(kind="assistant", status="delta", text="旧输出"),
         )
 
-        self.assertEqual(
-            app._render_timeline_text(),
-            f"Assistant > {DEFAULT_OPENING_MESSAGE}",
-        )
+        text = app._render_timeline_text()
+        self.assertEqual(len(app._items), 1)
+        self.assertEqual(app._items[0].kind, "assistant")
+        self.assertTrue(text.startswith("Assistant >"))
+        self.assertNotIn("旧输出", text)
 
     async def test_failed_tool_hides_traceback_but_keeps_internal_detail(self) -> None:
         """工具失败时主 timeline 不应直接展示 traceback，但内部 detail 仍应保留。"""
@@ -1880,7 +1923,6 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"{DEFAULT_AGENT_BRAND} · RuntimeError: boom", text)
         self.assertNotIn("Traceback (most recent call last):", text)
         self.assertEqual(system_item.metadata.get("raw_text"), traceback_text)
-
 
 if __name__ == "__main__":
     unittest.main()
