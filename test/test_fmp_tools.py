@@ -184,7 +184,7 @@ class FmpEasyHarnessToolTests(unittest.TestCase):
         self.assertEqual(output.data["method_name"], "get_profile")
         self.assertEqual(output.data["request"]["symbol"], "aapl")
         self.assertEqual(output.data["request"]["extra_params"], {"limit": 1})
-        self.assertIn("fmp_get_profile", output.preview)
+        self.assertIn("返回 1 条记录", output.preview)
 
     def test_date_range_tool_delegates_date_window_and_extra_params(self) -> None:
         """日期区间类工具应保留显式日期参数并透传附加字段。"""

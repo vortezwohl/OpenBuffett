@@ -37,7 +37,8 @@ _THINKING_HISTORY_BODY_STYLE = "#b2bbb3"
 _TIMING_STYLE = "#7e9b84"
 _THINKING_STYLE = "bold #88ad8f"
 _LOW_EMPHASIS_STYLE = _THINKING_STYLE
-_TOOL_BLOCK_STYLE = "bold #d8ffe0"
+_TOOL_LABEL_STYLE = "bold #a8c1ae"
+_TOOL_TEXT_STYLE = "#d3ded5"
 _SUPPORTED_COMMANDS = ("/stop", "/new", "/help")
 _COMMAND_HELP_TEXT = (
     "Available commands: /stop interrupts the active reply, /new starts a new session, /help shows this help."
@@ -168,6 +169,7 @@ class AgentWorkbenchApp(App[None]):
         self._status_message = "Workbench ready."
         self._active_by_kind: dict[str, str] = {}
         self._active_tools: dict[str, str] = {}
+        self._active_compress_key = ""
         self._pending_turns: deque[_PendingTurn] = deque()
         self._active_turn: _PendingTurn | None = None
         self._active_worker: Worker[None] | None = None
@@ -262,6 +264,7 @@ class AgentWorkbenchApp(App[None]):
         self._turn_count = 0
         self._active_by_kind.clear()
         self._active_tools.clear()
+        self._active_compress_key = ""
         self._pending_turns.clear()
         self._active_turn = None
         self._active_worker = None
@@ -505,15 +508,51 @@ class AgentWorkbenchApp(App[None]):
         )
 
     def _apply_compress_event(self, event: AgentEvent) -> None:
-        self._append_item(
-            kind="compress",
-            title="SmartIPO",
-            body=event.text or "",
-            status=event.status,
-            started_at=self._parse_started_at(event.started_at),
-            duration_ms=event.duration_ms or 0,
-            metadata=self._event_data_dict(event),
-        )
+        body = self._compress_activity_text(event.status, event.text or "")
+        metadata = self._event_data_dict(event)
+        if event.status == "failed":
+            metadata["raw_text"] = event.text or ""
+        if event.status == "started":
+            item = self._get_item(self._active_compress_key)
+            if item is None:
+                self._active_compress_key = self._append_item(
+                    kind="compress",
+                    title="",
+                    body=body,
+                    status="started",
+                    started_at=self._parse_started_at(event.started_at),
+                    duration_ms=event.duration_ms or 0,
+                    metadata=metadata,
+                )
+                return
+            item.body = body
+            item.status = "started"
+            item.started_at = self._parse_started_at(event.started_at)
+            item.duration_ms = event.duration_ms or item.duration_ms
+            item.metadata.update(metadata)
+            return
+
+        item = self._get_item(self._active_compress_key)
+        if item is None:
+            self._active_compress_key = self._append_item(
+                kind="compress",
+                title="",
+                body=body,
+                status=event.status,
+                started_at=None,
+                duration_ms=event.duration_ms or 0,
+                metadata=metadata,
+            )
+            item = self._get_item(self._active_compress_key)
+        if item is None:
+            return
+        item.body = body
+        item.status = event.status
+        item.started_at = None
+        item.duration_ms = event.duration_ms or item.duration_ms
+        item.metadata.update(metadata)
+        if event.status in {"completed", "failed", "cancelled"}:
+            self._active_compress_key = ""
 
     def _complete_turn(self, turn_id: str) -> None:
         """标记一轮流式会话自然完成。"""
@@ -736,6 +775,14 @@ class AgentWorkbenchApp(App[None]):
             if message and "error" not in item.metadata:
                 item.metadata["error"] = message
         self._active_tools.clear()
+        if self._active_compress_key:
+            item = self._get_item(self._active_compress_key)
+            if item is not None and item.started_at is not None:
+                self._sync_running_item_duration(item)
+                item.status = status
+                item.started_at = None
+            if status in {"completed", "failed", "cancelled"}:
+                self._active_compress_key = ""
 
     def _is_active_turn(self, turn_id: str) -> bool:
         """判断某个 turn_id 是否仍对应当前活跃轮次。"""
@@ -1103,15 +1150,17 @@ class AgentWorkbenchApp(App[None]):
             return self._render_chat_message_renderable(item)
         if item.kind == "assistant":
             return self._render_chat_message_renderable(item)
-        if item.kind in {"system", "compress"}:
+        if item.kind == "system":
             return self._render_system_message_renderable(item)
+        if item.kind == "compress":
+            return self._render_compress_item_renderable(item)
         if item.kind == "thinking":
             if self._is_thinking_history_item(item):
                 return self._render_thinking_history_renderable(item)
             return self._render_thinking_item_renderable(item)
         if item.kind == "tool":
             return self._render_tool_item_renderable(item)
-        return Text(self._format_timeline_item(item), style="white")
+        return Text(self._format_timeline_item(item), style=_LOW_EMPHASIS_STYLE)
 
     @staticmethod
     def _render_chat_message_renderable(item: _TimelineItem) -> Text:
@@ -1140,8 +1189,8 @@ class AgentWorkbenchApp(App[None]):
             message.append(f"{item.title} · ", style=_LOW_EMPHASIS_STYLE)
             message.append(item.body, style=_LOW_EMPHASIS_STYLE)
             return message
-        message.append(f"{item.title} · ", style=_CHAT_PREFIX_STYLE)
-        message.append(item.body, style="white")
+        message.append(f"{item.title} · ", style=_LOW_EMPHASIS_STYLE)
+        message.append(item.body, style=_LOW_EMPHASIS_STYLE)
         return message
 
     @staticmethod
@@ -1155,27 +1204,40 @@ class AgentWorkbenchApp(App[None]):
         return message
 
     @staticmethod
+    def _render_compress_item_renderable(item: _TimelineItem) -> Text:
+        """渲染上下文压缩活动行。"""
+
+        message = Text()
+        message.append(AgentWorkbenchApp._format_duration(item.duration_ms), style=_TIMING_STYLE)
+        message.append(" · ", style=_TIMING_STYLE)
+        message.append(item.body, style=_LOW_EMPHASIS_STYLE)
+        return message
+
+    @staticmethod
     def _render_tool_item_renderable(item: _TimelineItem) -> Text:
         """渲染只面向用户的一行工具活动摘要。"""
 
         main_line = Text()
         main_line.append(AgentWorkbenchApp._format_duration(item.duration_ms), style=_TIMING_STYLE)
         main_line.append(" · ", style=_TIMING_STYLE)
-        main_line.append("{ ", style=_TOOL_BLOCK_STYLE)
-        main_line.append("Tool", style=_TOOL_BLOCK_STYLE)
-        main_line.append(f" {item.name or 'tool'}", style="white")
-        main_line.append(" · ", style=_TOOL_BLOCK_STYLE)
-        main_line.append(AgentWorkbenchApp._format_status_label(item.status), style=_TOOL_BLOCK_STYLE)
-        main_line.append(" }", style=_TOOL_BLOCK_STYLE)
+        main_line.append("Tool", style=_TOOL_LABEL_STYLE)
+        main_line.append(f" {item.name or 'tool'}", style=_TOOL_TEXT_STYLE)
+        main_line.append(" · ", style=_TIMING_STYLE)
+        main_line.append(
+            AgentWorkbenchApp._format_status_label(item.status),
+            style=_TOOL_LABEL_STYLE,
+        )
         summary = AgentWorkbenchApp._tool_user_summary(item)
         if summary:
             main_line.append(" · ", style=_TIMING_STYLE)
-            main_line.append(summary, style="white")
+            main_line.append(summary, style=_TOOL_TEXT_STYLE)
         return main_line
 
     def _format_timeline_item(self, item: _TimelineItem) -> str:
-        if item.kind in {"user", "assistant", "system", "compress"}:
+        if item.kind in {"user", "assistant", "system"}:
             return self._format_message_item(item)
+        if item.kind == "compress":
+            return self._format_compress_item(item)
         if item.kind == "thinking":
             if not self._is_waiting_thinking_item(item):
                 return self._format_assistant_item(item)
@@ -1203,10 +1265,15 @@ class AgentWorkbenchApp(App[None]):
 
         return f"{item.title}{item.body}"
 
+    def _format_compress_item(self, item: _TimelineItem) -> str:
+        """按活动风格渲染上下文压缩消息。"""
+
+        return f"{self._format_duration(item.duration_ms)} · {item.body}"
+
     def _format_tool_item(self, item: _TimelineItem) -> str:
         line = (
             f"{self._format_duration(item.duration_ms)} · "
-            f"{{ Tool {item.name or 'tool'} · {self._format_status_label(item.status)} }}"
+            f"Tool {item.name or 'tool'} · {self._format_status_label(item.status)}"
         )
         summary = self._tool_user_summary(item)
         if summary:
@@ -1384,10 +1451,30 @@ class AgentWorkbenchApp(App[None]):
                 return f"{name} failed."
             return f"{name} finished."
         if event.kind == "compress":
-            return "Context compressed."
+            return AgentWorkbenchApp._compress_activity_text(
+                event.status,
+                event.text or "",
+            )
         if event.status == "cancelled":
             return "Interrupted."
         return event.text or "System message."
+
+    @staticmethod
+    def _compress_activity_text(status: str, text: str) -> str:
+        """生成上下文压缩事件的英文活动文案。"""
+
+        detail = AgentWorkbenchApp._summarize_error_text(text) if text else ""
+        if status == "started":
+            return "Compressing context..."
+        if status == "completed":
+            return "Conversation compressed"
+        if status == "failed":
+            if detail:
+                return f"Context compression failed: {detail}"
+            return "Context compression failed."
+        if status == "cancelled":
+            return "Context compression interrupted."
+        return detail or "Conversation compressed"
 
     @staticmethod
     def _should_follow_scroll(scroll_widget: VerticalScroll) -> bool:

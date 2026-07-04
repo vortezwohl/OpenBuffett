@@ -200,12 +200,13 @@ class EasyHarnessToolingTests(unittest.TestCase):
             model = build_default_model_config()
 
         self.assertIsInstance(model, ModelConfig)
-        self.assertEqual(model.model, "openai/deepseek-v4-flash")
+        self.assertEqual(model.model, "openai/deepseek-v4-pro")
         self.assertEqual(model.api_key, "test-key")
         self.assertEqual(model.base_url, "https://example.com/v1")
         self.assertEqual(model.temperature, 0.01)
         self.assertEqual(model.top_p, 0.01)
         self.assertIsNone(model.seed)
+        self.assertEqual(model.context_window_limit, 900_000)
 
 if __name__ == "__main__":
     unittest.main()

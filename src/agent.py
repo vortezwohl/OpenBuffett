@@ -11,13 +11,14 @@ import os
 
 from dotenv import load_dotenv
 from easyharness import Agent, ModelConfig
+from easyharness._internal.conversation import EventingSummarizingConversationManager
 from easyharness.toolset import build_fileglide_tools
 
 from src.tool import BASIC_TOOL_NAMES, FMP_TOOL_NAMES, build_basic_tools, build_fmp_tools
 
 load_dotenv()
 
-DEFAULT_MODEL = "openai/deepseek-v4-flash"
+DEFAULT_MODEL = "openai/deepseek-v4-pro"
 DEFAULT_API_BASE = "https://api.deepseek.com/v1"
 DEFAULT_TEMPERATURE = 0.01
 DEFAULT_TOP_P = 0.01
@@ -137,6 +138,7 @@ def build_default_model_config() -> ModelConfig:
         temperature=DEFAULT_TEMPERATURE,
         top_p=DEFAULT_TOP_P,
         seed=DEFAULT_SEED,
+        context_window_limit=900_000,
     )
 
 
@@ -173,4 +175,7 @@ def build_default_agent(workspace_root: str | None = None) -> Agent:
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         tools=build_default_tools(workspace_root),
         enable_fileglide=False,
+        conversation_manager=EventingSummarizingConversationManager(
+            preserve_recent_messages=6,
+        ),
     )

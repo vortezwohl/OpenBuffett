@@ -20,8 +20,13 @@ from textual.widgets import Input, Static
 from src.tui.app import (
     AgentWorkbenchApp,
     _CHAT_PREFIX_STYLE,
+    _LOW_EMPHASIS_STYLE,
     _THINKING_HISTORY_BODY_STYLE,
     _THINKING_HISTORY_PREFIX_STYLE,
+    _TIMING_STYLE,
+    _TimelineItem,
+    _TOOL_LABEL_STYLE,
+    _TOOL_TEXT_STYLE,
 )
 
 _LONG_RESIZE_STATUS_MESSAGE = (
@@ -255,7 +260,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertRegex(
             tool_line,
-            r"^\d+\.\d{2}s · \{ Tool fileglide_read_text · Done \} · fileglide_read_text: README\.md$",
+            r"^\d+\.\d{2}s · Tool fileglide_read_text · Done · fileglide_read_text: README\.md$",
         )
         self.assertNotIn("Call tool-1", text)
         self.assertNotIn("Result README.md", text)
@@ -295,7 +300,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertRegex(
             tool_line,
-            r"^\d+\.\d{2}s · \{ Tool fileglide_edit_text · Failed \} · Error: permission denied$",
+            r"^\d+\.\d{2}s · Tool fileglide_edit_text · Failed · Error: permission denied$",
         )
 
     async def test_system_failure_is_rendered(self) -> None:
@@ -318,6 +323,24 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertIn("SmartIPO · 模型调用失败", text)
+
+    def test_system_renderable_uses_low_emphasis_style(self) -> None:
+        """system 消息应统一使用次要色。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._apply_agent_event(
+            AgentEvent(kind="system", status="failed", text="request failed")
+        )
+
+        system_item = [item for item in app._items if item.kind == "system"][-1]
+        system_renderable = app._render_timeline_item_renderable(system_item)
+        styles = [span.style for span in system_renderable.spans]
+
+        self.assertIsInstance(system_renderable, Text)
+        self.assertIn("request failed", system_renderable.plain)
+        self.assertIn(_LOW_EMPHASIS_STYLE, styles)
+        self.assertNotIn(_CHAT_PREFIX_STYLE, styles)
+        self.assertNotIn("white", styles)
 
     async def test_submit_starts_local_thinking_before_first_agent_event(self) -> None:
         """用户提交后应先看到本地 thinking 计时，再等真实输出到来。"""
@@ -550,7 +573,35 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         text = app._render_timeline_text()
 
         self.assertNotIn("Thinking ...", text)
-        self.assertIn("{ Tool fileglide_read_text · Running }", text)
+        self.assertIn("Tool fileglide_read_text · Running", text)
+        self.assertNotIn("{ Tool", text)
+
+    def test_tool_renderable_uses_secondary_styles_without_braces(self) -> None:
+        """tool 主行应使用次级样式层级，且不再包含花括号。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fileglide_read_text",
+                data={"tool_use_id": "tool-1"},
+            )
+        )
+
+        tool_item = [item for item in app._items if item.kind == "tool"][-1]
+        tool_renderable = app._render_timeline_item_renderable(tool_item)
+
+        self.assertIsInstance(tool_renderable, Text)
+        self.assertEqual(
+            tool_renderable.plain,
+            "0.00s · Tool fileglide_read_text · Running",
+        )
+        self.assertIn(_TOOL_LABEL_STYLE, [span.style for span in tool_renderable.spans])
+        self.assertIn(_TOOL_TEXT_STYLE, [span.style for span in tool_renderable.spans])
+        self.assertNotIn("white", [span.style for span in tool_renderable.spans])
+        self.assertNotIn("{", tool_renderable.plain)
+        self.assertNotIn("}", tool_renderable.plain)
 
     def test_runtime_thinking_text_becomes_visible_history(self) -> None:
         """收到真实 thinking 文本后，应通过 assistant 表面保留为可见历史。"""
@@ -641,6 +692,93 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("white", [span.style for span in assistant_renderable.spans])
         self.assertNotIn(_CHAT_PREFIX_STYLE, [span.style for span in history_renderable.spans])
         self.assertNotIn("white", [span.style for span in history_renderable.spans])
+
+    def test_compress_events_render_as_single_timed_english_activity(self) -> None:
+        """compress 完成后应收口为单条英文活动行。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        app._apply_agent_event(
+            AgentEvent(kind="compress", status="started", duration_ms=0)
+        )
+        app._apply_agent_event(
+            AgentEvent(kind="compress", status="completed", duration_ms=12)
+        )
+
+        text = app._render_timeline_text()
+        compress_items = [item for item in app._items if item.kind == "compress"]
+
+        self.assertEqual(len(compress_items), 1)
+        self.assertEqual(compress_items[0].body, "Conversation compressed")
+        self.assertIsNone(compress_items[0].started_at)
+        self.assertIn("0.01s · Conversation compressed", text)
+        self.assertNotIn("Compressing context...", text)
+        self.assertNotIn("SmartIPO · Compressing context...", text)
+        self.assertNotIn("SmartIPO · Conversation compressed", text)
+
+    def test_compress_renderable_uses_timing_and_low_emphasis_styles(self) -> None:
+        """compress 行应复用计时前缀和低强调正文样式。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._apply_agent_event(
+            AgentEvent(kind="compress", status="completed", duration_ms=12)
+        )
+
+        compress_item = [item for item in app._items if item.kind == "compress"][-1]
+        compress_renderable = app._render_timeline_item_renderable(compress_item)
+
+        self.assertIsInstance(compress_renderable, Text)
+        self.assertEqual(compress_renderable.plain, "0.01s · Conversation compressed")
+        self.assertIn(_TIMING_STYLE, [span.style for span in compress_renderable.spans])
+        self.assertIn(
+            _LOW_EMPHASIS_STYLE,
+            [span.style for span in compress_renderable.spans],
+        )
+        self.assertNotIn(_CHAT_PREFIX_STYLE, [span.style for span in compress_renderable.spans])
+
+    def test_fallback_timeline_renderable_uses_low_emphasis_style(self) -> None:
+        """非 user/assistant 的兜底 timeline 项也不应回退到白色。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        renderable = app._render_timeline_item_renderable(
+            _TimelineItem(
+                key="meta-1",
+                kind="meta",
+                title="",
+                status="running",
+                name="background-task",
+            )
+        )
+
+        self.assertIsInstance(renderable, Text)
+        self.assertEqual(renderable.style, _LOW_EMPHASIS_STYLE)
+        self.assertNotEqual(renderable.style, "white")
+
+    def test_failed_compress_event_reuses_single_item(self) -> None:
+        """compress 失败时也应复用同一条时间线项并结束计时。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        app._apply_agent_event(
+            AgentEvent(kind="compress", status="started", duration_ms=0)
+        )
+        app._apply_agent_event(
+            AgentEvent(
+                kind="compress",
+                status="failed",
+                duration_ms=12,
+                text="Cannot summarize: insufficient messages for summarization",
+            )
+        )
+
+        compress_items = [item for item in app._items if item.kind == "compress"]
+
+        self.assertEqual(len(compress_items), 1)
+        self.assertEqual(
+            compress_items[0].body,
+            "Context compression failed: Cannot summarize: insufficient messages for summarization",
+        )
+        self.assertIsNone(compress_items[0].started_at)
 
     def test_thinking_tool_assistant_chronology_preserves_thinking_history(self) -> None:
         """真实 thinking 历史在 tool 和最终 assistant 之后仍应可见。"""
@@ -941,7 +1079,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertIn("Assistant > 这是半句", text)
-        self.assertIn("SmartIPO · Reply stopped.", text)
+        self.assertIn("SmartIPO · Interrupted.", text)
         self.assertEqual(agent.cancel_count, 1)
         self.assertIsNone(app._active_turn)
         self.assertEqual(app._turn_count, 1)
@@ -999,9 +1137,9 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.25)
             text = app._render_timeline_text()
 
-        self.assertIn("0.01s · { Tool fileglide_read_text · Stopped }", text)
+        self.assertIn("0.01s · Tool fileglide_read_text · Stopped", text)
         self.assertNotIn("Failed", text)
-        self.assertIn("SmartIPO · Reply stopped.", text)
+        self.assertIn("SmartIPO · Interrupted.", text)
 
     async def test_cancelled_turn_ignores_late_events_and_continues_queue(self) -> None:
         """取消收口后，旧 turn 迟到事件不应污染后续排队 turn。"""
@@ -1065,7 +1203,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, ["第一条", "第二条"])
-        self.assertIn("SmartIPO · Reply stopped.", text)
+        self.assertIn("SmartIPO · Interrupted.", text)
         self.assertIn("Assistant > 第二条完成", text)
         self.assertNotIn("旧输出", text)
 
@@ -1184,7 +1322,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertRegex(
             tool_line,
-            r"^\d+\.\d{2}s · \{ Tool fileglide_edit_text · Failed \} · Error: boom$",
+            r"^\d+\.\d{2}s · Tool fileglide_edit_text · Failed · Error: boom$",
         )
         self.assertNotIn("Traceback (most recent call last):", text)
         self.assertEqual(tool_item.detail, traceback_text)

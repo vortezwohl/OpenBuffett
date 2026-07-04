@@ -476,7 +476,7 @@ def _build_tool_output(
     """把底层 FMP 结果包装成统一 `ToolOutput`。"""
 
     summary = _summarize_result(result)
-    preview = f"{spec.tool_name}: {summary}"
+    preview = summary
     detail = "\n".join(
         [
             f"tool: {spec.tool_name}",
