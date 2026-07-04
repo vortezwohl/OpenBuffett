@@ -32,7 +32,7 @@ from vortezwohl.nlp import LevenshteinDistance
 
 from src.agent import build_default_agent
 
-_TIMELINE_REFRESH_INTERVAL_SECONDS = 0.05
+_TIMELINE_REFRESH_INTERVAL_SECONDS = 0.003
 _CHAT_PREFIX_STYLE = "bold #d8ffe0"
 _THINKING_HISTORY_PREFIX_STYLE = "bold #91ab97"
 _THINKING_HISTORY_BODY_STYLE = "#b2bbb3"
@@ -44,8 +44,13 @@ _TOOL_TEXT_STYLE = "#d3ded5"
 _THINKING_STATE_KEY = "thinking_state"
 _THINKING_PLACEHOLDER_STATE = "placeholder"
 _THINKING_HISTORY_STATE = "history"
-_THINKING_ANIMATION_FRAME_DURATION_MS = 300
+_THINKING_ANIMATION_FRAME_DURATION_MS = 128
 _THINKING_ANIMATION_FRAMES = ("...", ".", "..")
+_PLACEHOLDER_MIN_VISIBLE_DURATION_MS = 128
+_PLACEHOLDER_MIN_VISIBLE_UNTIL_KEY = "placeholder_min_visible_until"
+_TEXT_REVEAL_TARGET_KEY = "text_reveal_target"
+_PENDING_TEXT_TERMINAL_STATUS_KEY = "pending_text_terminal_status"
+_PENDING_TEXT_TERMINAL_DURATION_KEY = "pending_text_terminal_duration_ms"
 _LOCAL_STARTED_MONOTONIC_KEY = "local_started_monotonic"
 _PENDING_TERMINAL_DURATION_KEY = "pending_terminal_duration_ms"
 _TOOL_STARTED_AT_RAW_KEY = "tool_started_at_raw"
@@ -81,6 +86,23 @@ class _PendingTurn:
     turn_id: str
     prompt: str
     user_item_key: str
+
+
+@dataclass(slots=True)
+class _QueuedTurnEvent:
+    """描述尚未进入可见时间线的原始 agent 事件。"""
+
+    turn_id: str
+    event: AgentEvent
+
+
+@dataclass(slots=True)
+class _TextRevealChunk:
+    """描述等待按节拍逐字符吐出的文本片段。"""
+
+    turn_id: str
+    item_key: str
+    text: str
 
 
 class AgentWorkbenchApp(App[None]):
@@ -183,8 +205,11 @@ class AgentWorkbenchApp(App[None]):
         self._pending_tool_terminal_durations: dict[str, int] = {}
         self._pending_tool_terminal_lock = threading.Lock()
         self._pending_turns: deque[_PendingTurn] = deque()
+        self._pending_display_events: deque[_QueuedTurnEvent] = deque()
+        self._pending_text_reveal_queue: deque[_TextRevealChunk] = deque()
         self._active_turn: _PendingTurn | None = None
         self._active_worker: Worker[None] | None = None
+        self._raw_stream_done_turn_id: str | None = None
         self._stopping_turn_id: str | None = None
         self._cancelled_turn_id: str | None = None
         self._full_repaint_scheduled = False
@@ -278,8 +303,11 @@ class AgentWorkbenchApp(App[None]):
         self._active_tools.clear()
         self._active_compress_key = ""
         self._pending_turns.clear()
+        self._pending_display_events.clear()
+        self._pending_text_reveal_queue.clear()
         self._active_turn = None
         self._active_worker = None
+        self._raw_stream_done_turn_id = None
         self._stopping_turn_id = None
         self._cancelled_turn_id = None
         self._status_message = "Started a new session."
@@ -318,21 +346,42 @@ class AgentWorkbenchApp(App[None]):
                 if worker.is_cancelled:
                     return
                 self._record_pending_tool_terminal_event(event)
-                self.call_from_thread(self._apply_agent_event_for_turn, turn_id, event)
+                self.call_from_thread(self._enqueue_agent_event_for_turn, turn_id, event)
             if worker.is_cancelled:
                 return
-            self.call_from_thread(self._complete_turn, turn_id)
+            self.call_from_thread(self._mark_turn_stream_complete, turn_id)
         except Exception as error:  # pragma: no cover
             self.call_from_thread(self._show_error, turn_id, f"Request failed: {error}")
 
-    def _apply_agent_event_for_turn(self, turn_id: str, event: AgentEvent) -> None:
-        """仅当事件属于当前活跃轮次时，才把它应用到本地展示态。"""
+    def _enqueue_agent_event_for_turn(self, turn_id: str, event: AgentEvent) -> None:
+        """把当前活跃 turn 的原始事件排入显示层队列。"""
 
         if not self._is_active_turn(turn_id):
             return
-        self._apply_agent_event(event)
+        self._pending_display_events.append(
+            _QueuedTurnEvent(
+                turn_id=turn_id,
+                event=event,
+            )
+        )
+        self._process_display_pipeline(allow_reveal=False)
 
-    def _apply_agent_event(self, event: AgentEvent) -> None:
+    def _mark_turn_stream_complete(self, turn_id: str) -> None:
+        """标记当前 turn 的原始事件流已经结束，等待显示层排空后再收尾。"""
+
+        if not self._is_active_turn(turn_id):
+            return
+        self._raw_stream_done_turn_id = turn_id
+        self._try_complete_active_turn()
+
+    def _apply_agent_event_for_turn(self, turn_id: str, event: AgentEvent) -> None:
+        """兼容旧测试入口：仅在事件属于当前活跃轮次时应用显示层逻辑。"""
+
+        if not self._is_active_turn(turn_id):
+            return
+        self._enqueue_agent_event_for_turn(turn_id, event)
+
+    def _apply_agent_event(self, event: AgentEvent, *, refresh_view: bool = True) -> None:
         """把 EasyHarness 事件应用到 TUI 本地展示态。"""
 
         if event.status == "cancelled":
@@ -347,9 +396,11 @@ class AgentWorkbenchApp(App[None]):
             self._apply_system_event(event)
         elif event.kind == "compress":
             self._apply_compress_event(event)
+        self._commit_ready_text_terminal_states()
         self._reconcile_waiting_feedback_after_event()
         self._status_message = self._format_event_status(event)
-        self._refresh_view()
+        if refresh_view:
+            self._refresh_view()
 
     def _apply_thinking_event(self, event: AgentEvent) -> None:
         if event.status == "started":
@@ -396,32 +447,23 @@ class AgentWorkbenchApp(App[None]):
                 self._restart_local_running_timer(item)
         if item is None:
             return
-        thinking_text = (event.text or "").strip()
+        thinking_text = self._normalize_thinking_text(event.text or "")
         if event.status == "delta":
             item.status = "delta"
             if thinking_text:
-                self._promote_thinking_item_to_history(
-                    item,
-                    thinking_text,
-                    append=True,
-                )
+                self._queue_thinking_text_reveal(item, thinking_text, append=True)
             else:
                 self._mark_thinking_as_placeholder(item, provisional=False)
             return
         if event.status in {"completed", "failed", "cancelled"}:
             self._sync_running_item_duration(item)
             if thinking_text:
-                self._promote_thinking_item_to_history(
-                    item,
-                    thinking_text,
-                    append=False,
-                )
-            item.status = event.status
-            item.duration_ms = max(item.duration_ms, event.duration_ms or 0)
-            item.started_at = None
-            item.metadata["provisional"] = False
-            self._clear_local_running_timer(item)
-            self._active_by_kind.pop("thinking", None)
+                self._queue_thinking_text_reveal(item, thinking_text, append=False)
+            self._set_pending_text_terminal(
+                item,
+                status=event.status,
+                duration_ms=max(item.duration_ms, event.duration_ms or 0),
+            )
 
     def _apply_tool_event(self, event: AgentEvent) -> None:
         self._remove_waiting_thinking_items()
@@ -530,6 +572,7 @@ class AgentWorkbenchApp(App[None]):
                 title="Assistant > ",
                 status="started",
                 started_at=self._parse_started_at(event.started_at),
+                metadata={_TEXT_REVEAL_TARGET_KEY: ""},
             )
             return
         item = self._get_item(self._active_by_kind.get("assistant", ""))
@@ -543,18 +586,32 @@ class AgentWorkbenchApp(App[None]):
             )
             item = self._get_item(key)
             self._active_by_kind["assistant"] = key
+            if item is not None:
+                self._set_text_reveal_target(item, "")
         if item is None:
             return
         if event.status == "delta" and event.text:
-            item.body += event.text
+            self._queue_assistant_text_reveal(
+                item,
+                event.text,
+                append=True,
+            )
             return
         if event.status in {"completed", "failed", "cancelled"}:
-            if event.text and (event.status != "cancelled" or not item.body):
-                item.body = event.text
-            item.status = event.status
-            item.duration_ms = event.duration_ms or item.duration_ms
-            item.started_at = None
-            self._active_by_kind.pop("assistant", None)
+            if event.text and (
+                event.status != "cancelled"
+                or not self._current_text_reveal_target(item)
+            ):
+                self._queue_assistant_text_reveal(
+                    item,
+                    event.text,
+                    append=False,
+                )
+            self._set_pending_text_terminal(
+                item,
+                status=event.status,
+                duration_ms=event.duration_ms or item.duration_ms,
+            )
 
     def _apply_system_event(self, event: AgentEvent) -> None:
         body = event.text or ""
@@ -652,6 +709,8 @@ class AgentWorkbenchApp(App[None]):
 
         if not self._is_active_turn(turn_id):
             return
+        self._clear_active_turn_display_pipeline()
+        self._raw_stream_done_turn_id = None
         self._settle_running_turn_items("failed", message=message)
         self._remove_waiting_thinking_items()
         self._append_item(
@@ -713,22 +772,27 @@ class AgentWorkbenchApp(App[None]):
             self.refresh(layout=True, repaint=True)
         self._schedule_timeline_follow(force_follow=force_follow)
 
-    def _start_local_thinking(self) -> None:
+    def _start_local_thinking(self, *, enforce_min_visibility: bool = False) -> None:
         """在收到真实事件前先启动本地 thinking 占位与计时。"""
 
         if self._get_active_thinking_item() is not None:
             return
+        metadata = {
+            "provisional": True,
+            "ephemeral": True,
+            "history": False,
+            _THINKING_STATE_KEY: _THINKING_PLACEHOLDER_STATE,
+        }
+        if enforce_min_visibility:
+            metadata[_PLACEHOLDER_MIN_VISIBLE_UNTIL_KEY] = (
+                time.perf_counter() + (_PLACEHOLDER_MIN_VISIBLE_DURATION_MS / 1000)
+            )
         self._active_by_kind["thinking"] = self._append_item(
             kind="thinking",
             title="thinking",
             status="started",
             started_at=datetime.now(timezone.utc),
-            metadata={
-                "provisional": True,
-                "ephemeral": True,
-                "history": False,
-                _THINKING_STATE_KEY: _THINKING_PLACEHOLDER_STATE,
-            },
+            metadata=metadata,
         )
         item = self._get_active_thinking_item()
         if item is not None:
@@ -746,6 +810,9 @@ class AgentWorkbenchApp(App[None]):
         item.metadata["provisional"] = provisional
         item.metadata["ephemeral"] = True
         item.metadata["history"] = False
+        item.metadata.pop(_TEXT_REVEAL_TARGET_KEY, None)
+        item.metadata.pop(_PENDING_TEXT_TERMINAL_STATUS_KEY, None)
+        item.metadata.pop(_PENDING_TEXT_TERMINAL_DURATION_KEY, None)
 
     def _promote_thinking_item_to_history(
         self,
@@ -766,6 +833,7 @@ class AgentWorkbenchApp(App[None]):
         item.metadata["history"] = True
         item.metadata["provisional"] = False
         item.metadata[_THINKING_STATE_KEY] = _THINKING_HISTORY_STATE
+        self._set_text_reveal_target(item, item.body)
 
     def _remove_waiting_thinking_items(self) -> None:
         """只移除仍然停留在 waiting-only 状态的 thinking 占位。"""
@@ -808,10 +876,11 @@ class AgentWorkbenchApp(App[None]):
         self._clear_all_pending_tool_terminal_snapshots()
         turn = self._pending_turns.popleft()
         self._active_turn = turn
+        self._raw_stream_done_turn_id = None
         self._stopping_turn_id = None
         self._cancelled_turn_id = None
         self._refresh_turn_queue_metadata()
-        self._start_local_thinking()
+        self._start_local_thinking(enforce_min_visibility=True)
         self._status_message = "Processing queued message."
         self._refresh_view(force_follow=True)
         self._active_worker = self._run_turn_worker(turn.turn_id, turn.prompt)
@@ -823,18 +892,68 @@ class AgentWorkbenchApp(App[None]):
             return
         self._active_worker = None
         self._clear_all_pending_tool_terminal_snapshots()
+        self._clear_active_turn_display_pipeline()
         item = self._get_item(self._active_turn.user_item_key)
         if item is not None:
             item.metadata["queue_state"] = queue_state
             item.metadata["queue_position"] = None
             item.status = "failed" if queue_state == "failed" else "completed"
         self._active_turn = None
+        self._raw_stream_done_turn_id = None
         self._stopping_turn_id = None
         self._cancelled_turn_id = None
         self._refresh_turn_queue_metadata()
         self._status_message = status_message
         self._refresh_view(force_follow=True)
         self._start_next_turn_if_idle()
+
+    def _clear_active_turn_display_pipeline(self) -> None:
+        """清理当前活跃 turn 的显示层缓冲状态。"""
+
+        if self._active_turn is None:
+            self._pending_display_events.clear()
+            self._pending_text_reveal_queue.clear()
+            return
+        turn_id = self._active_turn.turn_id
+        self._pending_display_events = deque(
+            event
+            for event in self._pending_display_events
+            if event.turn_id != turn_id
+        )
+        self._pending_text_reveal_queue = deque(
+            chunk
+            for chunk in self._pending_text_reveal_queue
+            if chunk.turn_id != turn_id
+        )
+
+    def _try_complete_active_turn(self) -> bool:
+        """仅在原始流和显示层都已排空时，才真正结束当前 turn。"""
+
+        if self._active_turn is None:
+            return False
+        turn_id = self._active_turn.turn_id
+        if self._raw_stream_done_turn_id != turn_id:
+            return False
+        if self._pending_display_events or self._pending_text_reveal_queue:
+            return False
+        if self._has_pending_text_terminal_states():
+            return False
+        self._complete_turn(turn_id)
+        return True
+
+    def _has_pending_text_terminal_states(self) -> bool:
+        """判断当前活跃文本条目是否还有等待 reveal 排空后提交的终态。"""
+
+        for kind in ("thinking", "assistant"):
+            item = self._get_item(self._active_by_kind.get(kind, ""))
+            if item is None:
+                continue
+            pending_status = str(
+                item.metadata.get(_PENDING_TEXT_TERMINAL_STATUS_KEY, "")
+            ).strip()
+            if pending_status:
+                return True
+        return False
 
     def _refresh_turn_queue_metadata(self) -> None:
         """同步当前活跃条目与待处理条目的队列状态。"""
@@ -978,8 +1097,81 @@ class AgentWorkbenchApp(App[None]):
             if duration_ms != item.duration_ms:
                 item.duration_ms = duration_ms
                 changed = True
+        if self._process_display_pipeline():
+            changed = True
+        if self._try_complete_active_turn():
+            changed = True
         if changed:
             self._render_timeline()
+
+    def _process_display_pipeline(self, *, allow_reveal: bool = True) -> bool:
+        """推进显示层事件回放、逐字符 reveal 与文本终态收口。"""
+
+        changed = False
+        if allow_reveal and self._advance_text_reveal():
+            changed = True
+        if self._drain_pending_display_events():
+            changed = True
+        if self._commit_ready_text_terminal_states():
+            self._restore_waiting_thinking_if_turn_still_active()
+            changed = True
+        return changed
+
+    def _drain_pending_display_events(self) -> bool:
+        """按可见顺序回放等待中的原始 agent 事件。"""
+
+        changed = False
+        while self._pending_display_events:
+            queued_event = self._pending_display_events[0]
+            if not self._is_active_turn(queued_event.turn_id):
+                self._pending_display_events.popleft()
+                changed = True
+                continue
+            if self._pending_text_reveal_queue:
+                break
+            if self._should_delay_event_for_placeholder(queued_event.event):
+                break
+            self._pending_display_events.popleft()
+            self._apply_agent_event(queued_event.event, refresh_view=False)
+            changed = True
+            if self._pending_text_reveal_queue:
+                break
+        return changed
+
+    def _advance_text_reveal(self) -> bool:
+        """每个刷新节拍最多吐出一个可见字符。"""
+
+        if not self._pending_text_reveal_queue:
+            return False
+        chunk = self._pending_text_reveal_queue[0]
+        if not self._is_active_turn(chunk.turn_id):
+            self._pending_text_reveal_queue.popleft()
+            return True
+        item = self._get_item(chunk.item_key)
+        if item is None or not chunk.text:
+            self._pending_text_reveal_queue.popleft()
+            return True
+        item.body += chunk.text[0]
+        remainder = chunk.text[1:]
+        if remainder:
+            chunk.text = remainder
+        else:
+            self._pending_text_reveal_queue.popleft()
+        return True
+
+    def _should_delay_event_for_placeholder(self, event: AgentEvent) -> bool:
+        """判断当前事件是否需要等待 placeholder 最短可见时长结束后再显示。"""
+
+        item = self._get_active_thinking_item()
+        if item is None or not self._is_waiting_thinking_item(item):
+            return False
+        min_visible_until = item.metadata.get(_PLACEHOLDER_MIN_VISIBLE_UNTIL_KEY)
+        if not isinstance(min_visible_until, (int, float)):
+            return False
+        if time.perf_counter() >= float(min_visible_until):
+            item.metadata.pop(_PLACEHOLDER_MIN_VISIBLE_UNTIL_KEY, None)
+            return False
+        return event.kind in {"thinking", "assistant", "tool", "compress"}
 
     @staticmethod
     def _running_item_duration_ms(item: _TimelineItem) -> int:
@@ -1206,6 +1398,8 @@ class AgentWorkbenchApp(App[None]):
             self._status_message = "Stopping active reply."
             return
         self._cancel_active_worker()
+        self._clear_active_turn_display_pipeline()
+        self._raw_stream_done_turn_id = None
         self._interrupt_running_turn_items()
         self._remove_waiting_thinking_items()
         self._append_system_message("Interrupted the active reply.")
@@ -1699,6 +1893,143 @@ class AgentWorkbenchApp(App[None]):
         if normalized_existing.endswith(normalized_incoming):
             return normalized_existing
         return normalized_existing + normalized_incoming
+
+    @staticmethod
+    def _normalize_thinking_text(text: str) -> str:
+        """把 runtime thinking 中的换行控制字符压平为单行显示文本。"""
+
+        return (
+            str(text)
+            .replace("\r\n", " ")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+
+    @staticmethod
+    def _current_text_reveal_target(item: _TimelineItem) -> str:
+        """返回某个文本条目当前已知的完整目标文本。"""
+
+        return str(item.metadata.get(_TEXT_REVEAL_TARGET_KEY, item.body))
+
+    @staticmethod
+    def _set_text_reveal_target(item: _TimelineItem, text: str) -> None:
+        """记录某个文本条目最终应被 reveal 出来的目标文本。"""
+
+        item.metadata[_TEXT_REVEAL_TARGET_KEY] = str(text)
+
+    def _queue_thinking_text_reveal(
+        self,
+        item: _TimelineItem,
+        text: str,
+        *,
+        append: bool,
+    ) -> None:
+        """把 thinking 文本更新转成逐字符 reveal backlog。"""
+
+        previous_target = self._current_text_reveal_target(item)
+        merged_target = self._merge_thinking_text(previous_target, text, append=append)
+        item.title = "Assistant (Thinking) > "
+        item.metadata["ephemeral"] = False
+        item.metadata["history"] = True
+        item.metadata["provisional"] = False
+        item.metadata[_THINKING_STATE_KEY] = _THINKING_HISTORY_STATE
+        self._set_text_reveal_target(item, merged_target)
+        self._enqueue_text_reveal_suffix(
+            item,
+            previous_target=previous_target,
+            next_target=merged_target,
+        )
+
+    def _queue_assistant_text_reveal(
+        self,
+        item: _TimelineItem,
+        text: str,
+        *,
+        append: bool,
+    ) -> None:
+        """把 assistant 文本更新转成逐字符 reveal backlog。"""
+
+        previous_target = self._current_text_reveal_target(item)
+        merged_target = self._merge_thinking_text(previous_target, text, append=append)
+        self._set_text_reveal_target(item, merged_target)
+        self._enqueue_text_reveal_suffix(
+            item,
+            previous_target=previous_target,
+            next_target=merged_target,
+        )
+
+    def _enqueue_text_reveal_suffix(
+        self,
+        item: _TimelineItem,
+        *,
+        previous_target: str,
+        next_target: str,
+    ) -> None:
+        """把目标文本中新追加的后缀排入逐字符 reveal 队列。"""
+
+        if not next_target.startswith(previous_target):
+            return
+        suffix = next_target[len(previous_target) :]
+        if not suffix:
+            return
+        if self._active_turn is None or self._active_worker is None:
+            item.body += suffix
+            return
+        self._pending_text_reveal_queue.append(
+            _TextRevealChunk(
+                turn_id=self._active_turn.turn_id,
+                item_key=item.key,
+                text=suffix,
+            )
+        )
+
+    @staticmethod
+    def _set_pending_text_terminal(
+        item: _TimelineItem,
+        *,
+        status: str,
+        duration_ms: int,
+    ) -> None:
+        """登记文本条目在 reveal 排空后需要提交的终态。"""
+
+        item.metadata[_PENDING_TEXT_TERMINAL_STATUS_KEY] = status
+        item.metadata[_PENDING_TEXT_TERMINAL_DURATION_KEY] = duration_ms
+
+    def _commit_ready_text_terminal_states(self) -> bool:
+        """把已经 reveal 完成的文本条目收口到终态。"""
+
+        changed = False
+        for kind in ("thinking", "assistant"):
+            item = self._get_item(self._active_by_kind.get(kind, ""))
+            if item is None:
+                continue
+            pending_status = str(
+                item.metadata.get(_PENDING_TEXT_TERMINAL_STATUS_KEY, "")
+            ).strip()
+            if not pending_status or self._item_has_reveal_backlog(item.key):
+                continue
+            item.status = pending_status
+            item.duration_ms = max(
+                item.duration_ms,
+                int(item.metadata.get(_PENDING_TEXT_TERMINAL_DURATION_KEY, 0)),
+            )
+            item.started_at = None
+            item.metadata["provisional"] = False
+            self._clear_local_running_timer(item)
+            item.metadata.pop(_PENDING_TEXT_TERMINAL_STATUS_KEY, None)
+            item.metadata.pop(_PENDING_TEXT_TERMINAL_DURATION_KEY, None)
+            self._active_by_kind.pop(kind, None)
+            if kind == "thinking" and self._is_waiting_thinking_item(item):
+                self._items = [existing for existing in self._items if existing.key != item.key]
+            changed = True
+        return changed
+
+    def _item_has_reveal_backlog(self, item_key: str) -> bool:
+        """判断某个条目是否仍有待吐出的字符 backlog。"""
+
+        return any(
+            chunk.item_key == item_key for chunk in self._pending_text_reveal_queue
+        )
 
     @staticmethod
     def _is_waiting_thinking_item(item: _TimelineItem) -> bool:

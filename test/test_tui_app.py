@@ -24,6 +24,7 @@ from src.tui.app import (
     _LOW_EMPHASIS_STYLE,
     _PENDING_TERMINAL_DURATION_KEY,
     _PendingTurn,
+    _TIMELINE_REFRESH_INTERVAL_SECONDS,
     _THINKING_ANIMATION_FRAME_DURATION_MS,
     _THINKING_HISTORY_BODY_STYLE,
     _THINKING_HISTORY_PREFIX_STYLE,
@@ -214,6 +215,50 @@ async def _capture_stable_screenshot(
     return previous_snapshot
 
 
+async def _wait_for_all_turns_to_finish(
+    pilot,
+    app: AgentWorkbenchApp,
+    *,
+    timeout_seconds: float = 2.0,
+    pause_seconds: float = 0.05,
+) -> None:
+    """等待当前 active turn 与排队 turn 全部收尾。"""
+
+    deadline = time.perf_counter() + timeout_seconds
+    while time.perf_counter() < deadline:
+        if app._active_turn is None and not app._pending_turns:
+            return
+        await pilot.pause(pause_seconds)
+    raise AssertionError("Timed out waiting for all turns to finish.")
+
+
+def _activate_manual_turn(
+    app: AgentWorkbenchApp,
+    *,
+    turn_id: str = "turn-1",
+    prompt: str = "继续处理",
+) -> str:
+    """为单元测试手工挂起一个活跃 turn。"""
+
+    user_key = app._append_user_message(
+        prompt,
+        metadata={"turn_id": turn_id, "queue_state": "running", "queue_position": 0},
+    )
+    app._active_turn = _PendingTurn(
+        turn_id=turn_id,
+        prompt=prompt,
+        user_item_key=user_key,
+    )
+    return turn_id
+
+
+def _advance_display_ticks(app: AgentWorkbenchApp, ticks: int) -> None:
+    """手动推进若干个显示层刷新 tick。"""
+
+    for _ in range(ticks):
+        app._refresh_running_items()
+
+
 class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
     """验证 Textual 工作台的 EasyHarness 事件流闭环。"""
 
@@ -296,7 +341,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 {"input": input_widget, "value": "写文件"},
             )()
             app.on_input_submitted(fake_event)
-            await pilot.pause(0.35)
+            await pilot.pause(0.6)
             text = app._render_timeline_text()
 
         tool_line = next(
@@ -323,7 +368,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 {"input": input_widget, "value": "你好"},
             )()
             app.on_input_submitted(fake_event)
-            await pilot.pause(0.35)
+            await _wait_for_all_turns_to_finish(pilot, app)
             text = app._render_timeline_text()
 
         self.assertIn("SmartIPO · 模型调用失败", text)
@@ -460,7 +505,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             queue_text = app._render_queue_tray_text()
             queue_renderable = app._render_queue_tray_renderable()
             queue_visible_during_wait = queue_widget.display
-            await pilot.pause(0.65)
+            await _wait_for_all_turns_to_finish(pilot, app)
             final_text = app._render_timeline_text()
             final_queue_text = app._render_queue_tray_text()
             final_queue_visible = queue_widget.display
@@ -509,7 +554,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                     {"input": input_widget, "value": prompt},
                 )()
                 app.on_input_submitted(fake_event)
-            await pilot.pause(0.4)
+            await _wait_for_all_turns_to_finish(pilot, app)
             text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, ["第一条", "第二条"])
@@ -548,6 +593,56 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(second_text, r"Thinking \.{1,3}")
         self.assertRegex(third_text, r"Thinking \.{1,3}")
         self.assertEqual(len({first_text, second_text, third_text}), 3)
+
+    def test_active_timeline_refresh_interval_is_10ms(self) -> None:
+        """运行中时间线刷新节拍应固定为 10ms。"""
+
+        self.assertEqual(_TIMELINE_REFRESH_INTERVAL_SECONDS, 0.01)
+
+    def test_assistant_reveal_waits_for_display_drain_before_finishing_turn(self) -> None:
+        """assistant 文本应逐字符 reveal，且 turn 必须等显示层排空后才结束。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        turn_id = _activate_manual_turn(app)
+        app._active_worker = object()
+
+        app._apply_agent_event(_started_event("assistant"))
+        app._apply_agent_event(
+            AgentEvent(kind="assistant", status="completed", text="OK")
+        )
+        assistant_item = [item for item in app._items if item.kind == "assistant"][-1]
+
+        app._mark_turn_stream_complete(turn_id)
+
+        self.assertEqual(assistant_item.body, "")
+        self.assertIsNotNone(app._active_turn)
+
+        _advance_display_ticks(app, 1)
+        self.assertEqual(assistant_item.body, "O")
+        self.assertIsNotNone(app._active_turn)
+
+        _advance_display_ticks(app, 1)
+        self.assertEqual(assistant_item.body, "OK")
+        self.assertIsNone(app._active_turn)
+
+    def test_initial_placeholder_stays_visible_for_50ms_before_first_covering_event(self) -> None:
+        """turn 首个 waiting placeholder 被真实动作覆盖前至少应可见 50ms。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        turn_id = _activate_manual_turn(app)
+        app._active_worker = object()
+        app._start_local_thinking(enforce_min_visibility=True)
+
+        app._enqueue_agent_event_for_turn(turn_id, _started_event("assistant"))
+
+        self.assertRegex(app._render_timeline_text(), r"Thinking \.{1,3}")
+        self.assertEqual(len([item for item in app._items if item.kind == "assistant"]), 0)
+
+        time.sleep(0.06)
+        _advance_display_ticks(app, 1)
+
+        self.assertIsNone(app._get_active_thinking_item())
+        self.assertEqual(len([item for item in app._items if item.kind == "assistant"]), 1)
 
     def test_running_thinking_entry_uses_utc_started_at_for_timer(self) -> None:
         """UTC started_at 不应被当成本地时间，避免计时跳到数小时。"""
@@ -928,6 +1023,31 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(thinking_item.metadata.get("ephemeral", True))
         self.assertTrue(thinking_item.metadata.get("history", False))
         self.assertEqual(thinking_item.body, "Reviewing the filing.")
+
+    def test_runtime_thinking_history_normalizes_newlines_before_display(self) -> None:
+        """thinking 历史进入时间线前不允许保留任何 \\r 或 \\n。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        app._apply_agent_event(_started_event("thinking"))
+        app._apply_agent_event(
+            AgentEvent(
+                kind="thinking",
+                status="completed",
+                text="Line 1\nLine 2\r\nLine 3\rLine 4",
+            )
+        )
+
+        thinking_item = [item for item in app._items if item.kind == "thinking"][-1]
+        text = app._render_timeline_text()
+
+        self.assertEqual(thinking_item.body, "Line 1 Line 2 Line 3 Line 4")
+        self.assertIn(
+            "Assistant (Thinking) > Line 1 Line 2 Line 3 Line 4",
+            text,
+        )
+        self.assertNotIn("\nLine 2", thinking_item.body)
+        self.assertNotIn("\r", thinking_item.body)
 
     def test_assistant_reply_appends_after_visible_thinking_history(self) -> None:
         """只有真实 thinking 和 assistant 时，最终回复也应作为后续阶段追加。"""
