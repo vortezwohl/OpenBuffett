@@ -1,6 +1,6 @@
 """默认模型配置最小回归测试。
 
-该文件验证 SmartIPO 不再通过旧模型装配层或多调用点配置表装配模型，
+该文件验证 OpenBuffett 不再通过旧模型装配层或多调用点配置表装配模型，
 而是由 `src.agent` 直接构造 EasyHarness `ModelConfig`。
 """
 

@@ -1,4 +1,4 @@
-"""SmartIPO 通用基础工具集合。
+"""OpenBuffett 通用基础工具集合。
 
 该文件提供三类与业务无关、但 agent 日常执行常会用到的最小工具：
 
@@ -190,7 +190,7 @@ def web_fetch_page(url: str, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS) ->
         timeout=timeout_seconds,
         allow_redirects=True,
         headers={
-            "User-Agent": "SmartIPO/0.1 web_fetch_page",
+            "User-Agent": "OpenBuffett/0.1 web_fetch_page",
         },
     )
     response.raise_for_status()

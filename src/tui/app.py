@@ -30,7 +30,11 @@ from textual.worker import Worker, get_current_worker
 from textual.widgets import Footer, Header, Input, Static
 from vortezwohl.nlp import LevenshteinDistance
 
-from src.agent import build_default_agent
+from src.agent import (
+    DEFAULT_AGENT_BRAND,
+    DEFAULT_OPENING_MESSAGE,
+    build_default_agent,
+)
 
 _TIMELINE_REFRESH_INTERVAL_SECONDS = 0.003
 _CHAT_PREFIX_STYLE = "bold #d8ffe0"
@@ -58,7 +62,10 @@ _SUPPORTED_COMMANDS = ("/stop", "/new", "/help")
 _COMMAND_HELP_TEXT = (
     "Available commands: /stop interrupts the active reply, /new starts a new session, /help shows this help."
 )
-_INPUT_PLACEHOLDER = "Send a message. /stop interrupts, /new resets, /help shows commands."
+_INPUT_PLACEHOLDER = (
+    f"Ask {DEFAULT_AGENT_BRAND} for valuation, IPO, or market-data research. "
+    "/stop interrupts, /new resets, /help shows commands."
+)
 _LOCKED_THEME_NAME = "ansi-dark"
 
 
@@ -106,9 +113,9 @@ class _TextRevealChunk:
 
 
 class AgentWorkbenchApp(App[None]):
-    """运行 SmartIPO EasyHarness agent 的单列本地工作台。"""
+    """运行 OpenBuffett EasyHarness agent 的单列本地工作台。"""
 
-    TITLE = "SmartIPO"
+    TITLE = DEFAULT_AGENT_BRAND
     SUB_TITLE = ""
 
     CSS = """
@@ -198,7 +205,7 @@ class AgentWorkbenchApp(App[None]):
         self._item_counter = 0
         self._turn_count = 0
         self._turn_serial = 0
-        self._status_message = "Workbench ready."
+        self._status_message = f"{DEFAULT_AGENT_BRAND} ready."
         self._active_by_kind: dict[str, str] = {}
         self._active_tools: dict[str, str] = {}
         self._active_compress_key = ""
@@ -235,6 +242,7 @@ class AgentWorkbenchApp(App[None]):
         """挂载后刷新界面并启动本地运行态计时。"""
 
         self._enforce_locked_theme()
+        self._append_opening_message()
         self._run_full_repaint(force_follow=True)
         self.set_interval(
             _TIMELINE_REFRESH_INTERVAL_SECONDS,
@@ -310,7 +318,8 @@ class AgentWorkbenchApp(App[None]):
         self._raw_stream_done_turn_id = None
         self._stopping_turn_id = None
         self._cancelled_turn_id = None
-        self._status_message = "Started a new session."
+        self._status_message = f"Started a new {DEFAULT_AGENT_BRAND} session."
+        self._append_opening_message()
         self._refresh_view()
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
@@ -624,7 +633,7 @@ class AgentWorkbenchApp(App[None]):
             body = self._summarize_error_text(body)
         self._append_item(
             kind="system",
-            title="SmartIPO",
+            title=DEFAULT_AGENT_BRAND,
             body=body,
             status=event.status,
             started_at=self._parse_started_at(event.started_at),
@@ -715,7 +724,7 @@ class AgentWorkbenchApp(App[None]):
         self._remove_waiting_thinking_items()
         self._append_item(
             kind="system",
-            title="SmartIPO",
+            title=DEFAULT_AGENT_BRAND,
             body=self._summarize_error_text(message),
             status="failed",
             metadata={"raw_text": message},
@@ -739,6 +748,33 @@ class AgentWorkbenchApp(App[None]):
             title="User > ",
             body=content,
             metadata=metadata,
+        )
+
+    def _append_assistant_message(
+        self,
+        content: str,
+        *,
+        status: str = "completed",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """追加助手消息条目，供欢迎语和静态历史消息复用。"""
+
+        return self._append_item(
+            kind="assistant",
+            title="Assistant > ",
+            body=content,
+            status=status,
+            metadata=metadata,
+        )
+
+    def _append_opening_message(self) -> None:
+        """在空白会话中注入默认开场自介，避免等待用户先发第一句。"""
+
+        if self._items:
+            return
+        self._append_assistant_message(
+            DEFAULT_OPENING_MESSAGE,
+            metadata={"opening_message": True},
         )
 
     def _enforce_locked_theme(self) -> None:
@@ -1451,11 +1487,11 @@ class AgentWorkbenchApp(App[None]):
         self._active_tools.clear()
 
     def _append_system_message(self, content: str, *, status: str = "completed") -> str:
-        """追加一条 SmartIPO 系统消息。"""
+        """追加一条 OpenBuffett 系统消息。"""
 
         return self._append_item(
             kind="system",
-            title="SmartIPO",
+            title=DEFAULT_AGENT_BRAND,
             body=content,
             status=status,
         )
@@ -1562,7 +1598,7 @@ class AgentWorkbenchApp(App[None]):
         """渲染顶部状态摘要。"""
 
         return (
-            "SmartIPO\n"
+            f"{DEFAULT_AGENT_BRAND}\n"
             f"Completed {self._turn_count} turns\n"
             f"{self._status_message}"
         )
@@ -1660,7 +1696,7 @@ class AgentWorkbenchApp(App[None]):
 
     @staticmethod
     def _render_system_message_renderable(item: _TimelineItem) -> Text:
-        """渲染 SmartIPO 系统类消息。"""
+        """渲染 OpenBuffett 系统类消息。"""
 
         message = Text()
         if item.status == "cancelled":
@@ -2067,7 +2103,7 @@ class AgentWorkbenchApp(App[None]):
     def _format_event_status(event: AgentEvent) -> str:
         if event.kind == "thinking":
             if event.status == "started":
-                return "SmartIPO is thinking."
+                return f"{DEFAULT_AGENT_BRAND} is thinking."
             if event.status == "cancelled":
                 return "Interrupted."
             if event.status == "failed":
@@ -2075,9 +2111,9 @@ class AgentWorkbenchApp(App[None]):
             return "Thinking complete."
         if event.kind == "assistant":
             if event.status == "started":
-                return "SmartIPO is drafting a reply."
+                return f"{DEFAULT_AGENT_BRAND} is drafting a reply."
             if event.status == "delta":
-                return "SmartIPO is drafting a reply."
+                return f"{DEFAULT_AGENT_BRAND} is drafting a reply."
             if event.status == "cancelled":
                 return "Interrupted."
             if event.status == "failed":

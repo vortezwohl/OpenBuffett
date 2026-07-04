@@ -19,7 +19,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 
 
 class ProjectSurfaceTests(unittest.TestCase):
-    """验证 SmartIPO 只保留当前真实需要的项目边界。"""
+    """验证 OpenBuffett 只保留当前真实需要的项目边界。"""
 
     def test_removed_framework_packages_do_not_exist(self) -> None:
         """旧框架包和泛用 util 层不应继续存在。"""

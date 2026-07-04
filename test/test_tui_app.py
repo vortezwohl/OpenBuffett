@@ -17,6 +17,7 @@ from rich.text import Text
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static
 
+from src.agent import DEFAULT_AGENT_BRAND, DEFAULT_OPENING_MESSAGE
 from src.tui.app import (
     AgentWorkbenchApp,
     _CHAT_PREFIX_STYLE,
@@ -371,7 +372,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await _wait_for_all_turns_to_finish(pilot, app)
             text = app._render_timeline_text()
 
-        self.assertIn("SmartIPO · 模型调用失败", text)
+        self.assertIn(f"{DEFAULT_AGENT_BRAND} · 模型调用失败", text)
 
     def test_system_renderable_uses_low_emphasis_style(self) -> None:
         """system 消息应统一使用次要色。"""
@@ -1109,7 +1110,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         text = app._render_timeline_text()
 
         self.assertIsNotNone(restored_item)
-        self.assertIn("SmartIPO · Still working.", text)
+        self.assertIn(f"{DEFAULT_AGENT_BRAND} · Still working.", text)
         self.assertRegex(text, r"Thinking \.{1,3}")
         self.assertTrue(restored_item.metadata.get("provisional", False))
         self.assertTrue(restored_item.metadata.get("ephemeral", False))
@@ -1177,8 +1178,8 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(compress_items[0].started_at)
         self.assertIn("0.01s · Conversation compressed", text)
         self.assertNotIn("Compressing context...", text)
-        self.assertNotIn("SmartIPO · Compressing context...", text)
-        self.assertNotIn("SmartIPO · Conversation compressed", text)
+        self.assertNotIn(f"{DEFAULT_AGENT_BRAND} · Compressing context...", text)
+        self.assertNotIn(f"{DEFAULT_AGENT_BRAND} · Conversation compressed", text)
 
     def test_completed_compress_restores_waiting_thinking_for_active_turn(self) -> None:
         """compression 结束后若 turn 仍活跃，应立即恢复本地 thinking 占位。"""
@@ -1342,7 +1343,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.reset_count, 1)
         self.assertEqual(app._turn_count, 0)
-        self.assertEqual(app._render_timeline_text(), "No messages yet.")
+        self.assertEqual(
+            app._render_timeline_text(),
+            f"Assistant > {DEFAULT_OPENING_MESSAGE}",
+        )
         self.assertEqual(app._render_queue_tray_text(), "")
 
     async def test_queue_tray_is_hidden_without_pending_turns(self) -> None:
@@ -1475,12 +1479,12 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored_snapshot, initial_snapshot)
 
     async def test_input_placeholder_and_text_prefixes_are_updated(self) -> None:
-        """输入框文案和对话前缀应切换到新的聊天视觉语言。"""
+        """输入框文案、品牌标题与启动开场消息应在首屏就生效。"""
 
         agent = _FakeStreamingAgent(
             [
                 _started_event("assistant"),
-                AgentEvent(kind="assistant", status="completed", text="你好，我是 SmartIPO"),
+                AgentEvent(kind="assistant", status="completed", text="继续回答"),
             ]
         )
         app = AgentWorkbenchApp(agent=agent)
@@ -1489,9 +1493,13 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             input_widget = app.query_one("#chat-input", Input)
             self.assertEqual(
                 input_widget.placeholder,
-                "Send a message. /stop interrupts, /new resets, /help shows commands.",
+                (
+                    f"Ask {DEFAULT_AGENT_BRAND} for valuation, IPO, or market-data research. "
+                    "/stop interrupts, /new resets, /help shows commands."
+                ),
             )
-            self.assertEqual(app.title, "SmartIPO")
+            self.assertEqual(app.title, DEFAULT_AGENT_BRAND)
+            initial_text = app._render_timeline_text()
             fake_event = type(
                 "FakeSubmittedEvent",
                 (),
@@ -1501,8 +1509,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             text = app._render_timeline_text()
 
+        self.assertIn(f"Assistant > {DEFAULT_OPENING_MESSAGE}", initial_text)
         self.assertIn("User > hi", text)
-        self.assertIn("Assistant > 你好，我是 SmartIPO", text)
+        self.assertIn(f"Assistant > {DEFAULT_OPENING_MESSAGE}", text)
+        self.assertIn("Assistant > 继续回答", text)
 
     async def test_help_command_is_handled_inside_tui(self) -> None:
         """/help 应直接在 TUI 内部处理，而不是进入 agent 排队。"""
@@ -1588,7 +1598,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         self.assertIn("Assistant > 这是半句", text)
-        self.assertIn("SmartIPO · Interrupted.", text)
+        self.assertIn(f"{DEFAULT_AGENT_BRAND} · Interrupted.", text)
         self.assertEqual(agent.cancel_count, 1)
         self.assertIsNone(app._active_turn)
         self.assertEqual(app._turn_count, 1)
@@ -1648,7 +1658,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("0.01s · Tool fileglide_read_text · Stopped", text)
         self.assertNotIn("Failed", text)
-        self.assertIn("SmartIPO · Interrupted.", text)
+        self.assertIn(f"{DEFAULT_AGENT_BRAND} · Interrupted.", text)
 
     async def test_cancelled_turn_ignores_late_events_and_continues_queue(self) -> None:
         """取消收口后，旧 turn 迟到事件不应污染后续排队 turn。"""
@@ -1712,7 +1722,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, ["第一条", "第二条"])
-        self.assertIn("SmartIPO · Interrupted.", text)
+        self.assertIn(f"{DEFAULT_AGENT_BRAND} · Interrupted.", text)
         self.assertIn("Assistant > 第二条完成", text)
         self.assertNotIn("旧输出", text)
 
@@ -1733,7 +1743,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             text = app._render_timeline_text()
 
-        self.assertIn("SmartIPO · There is no active reply to interrupt.", text)
+        self.assertIn(
+            f"{DEFAULT_AGENT_BRAND} · There is no active reply to interrupt.",
+            text,
+        )
 
     async def test_new_command_resets_session_and_ignores_old_turn_events(self) -> None:
         """/new 应重置本地会话，并继续忽略旧 turn 的迟到事件。"""
@@ -1761,7 +1774,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(agent.reset_count, 1)
-        self.assertEqual(app._render_timeline_text(), "No messages yet.")
+        self.assertEqual(
+            app._render_timeline_text(),
+            f"Assistant > {DEFAULT_OPENING_MESSAGE}",
+        )
         self.assertEqual(app._render_queue_tray_text(), "")
 
     def test_stale_turn_event_is_ignored_after_new_session(self) -> None:
@@ -1779,7 +1795,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             AgentEvent(kind="assistant", status="delta", text="旧输出"),
         )
 
-        self.assertEqual(app._render_timeline_text(), "No messages yet.")
+        self.assertEqual(
+            app._render_timeline_text(),
+            f"Assistant > {DEFAULT_OPENING_MESSAGE}",
+        )
 
     async def test_failed_tool_hides_traceback_but_keeps_internal_detail(self) -> None:
         """工具失败时主 timeline 不应直接展示 traceback，但内部 detail 仍应保留。"""
@@ -1858,7 +1877,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         system_item = next(item for item in app._items if item.kind == "system")
-        self.assertIn("SmartIPO · RuntimeError: boom", text)
+        self.assertIn(f"{DEFAULT_AGENT_BRAND} · RuntimeError: boom", text)
         self.assertNotIn("Traceback (most recent call last):", text)
         self.assertEqual(system_item.metadata.get("raw_text"), traceback_text)
 

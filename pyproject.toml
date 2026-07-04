@@ -1,7 +1,7 @@
 [project]
-name = "smartipo"
+name = "openbuffett"
 version = "0.1.0"
-description = "Add your description here"
+description = "OpenBuffett valuation-first US equity research workbench"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

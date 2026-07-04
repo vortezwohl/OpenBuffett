@@ -88,7 +88,7 @@ class BasicEasyHarnessToolTests(unittest.TestCase):
         response = _FakeResponse(
             text=(
                 "<html><head><title>Example Page</title></head>"
-                "<body><h1>Hello</h1><p>SmartIPO fetch test.</p></body></html>"
+                "<body><h1>Hello</h1><p>OpenBuffett fetch test.</p></body></html>"
             ),
             url="https://example.com/final",
         )
@@ -100,7 +100,7 @@ class BasicEasyHarnessToolTests(unittest.TestCase):
         self.assertEqual(output.data["status_code"], 200)
         self.assertEqual(output.data["final_url"], "https://example.com/final")
         self.assertEqual(output.data["title"], "Example Page")
-        self.assertIn("Hello SmartIPO fetch test.", output.data["text_excerpt"])
+        self.assertIn("Hello OpenBuffett fetch test.", output.data["text_excerpt"])
         self.assertIn("抓取成功", output.preview)
 
     def test_web_fetch_page_rejects_non_http_scheme(self) -> None:

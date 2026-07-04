@@ -1,5 +1,6 @@
-"""SmartIPO 源码包。
+"""OpenBuffett 源码包。
 
-项目底层 agent runtime、工具协议和事件流由 EasyHarness 提供；本包只保留
-默认 agent 装配、TUI 展示、业务工具和外部服务客户端边界。
+本包承载 OpenBuffett 的默认 agent 装配、TUI 展示、自定义研究工具与外部
+数据客户端边界。底层 agent runtime、工具协议与事件流由 EasyHarness 提供，
+因此这里主要维护产品表面、研究工作流合同与可验证的数据接入。
 """

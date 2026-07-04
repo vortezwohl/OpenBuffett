@@ -1,7 +1,7 @@
 """EasyHarness 工具与默认装配测试。
 
-该文件验证 SmartIPO 默认工具集合已经切换为 EasyHarness 公共工具合同：
-官方 fileglide toolset 提供文件能力，FMP 业务工具使用 `easyharness.tool` 声明。
+该文件验证 OpenBuffett 默认工具集合继续使用 EasyHarness 公共工具合同，
+并且默认 prompt、品牌常量与研究边界已经切换到估值优先的新产品定义。
 """
 
 from __future__ import annotations
@@ -14,9 +14,12 @@ from easyharness import Agent, ModelConfig
 from easyharness._internal.runtime import _EventMapper
 from src.ext.fmp import FmpClient
 from src.agent import (
+    DEFAULT_AGENT_BRAND,
     DEFAULT_BASIC_TOOL_NAMES,
     DEFAULT_BUSINESS_TOOL_NAMES,
     DEFAULT_FILEGLIDE_TOOL_NAMES,
+    DEFAULT_OPENING_MESSAGE,
+    DEFAULT_REPORT_FOLLOW_UP,
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_WORKBENCH_TOOL_NAMES,
     build_default_model_config,
@@ -136,8 +139,14 @@ class EasyHarnessToolingTests(unittest.TestCase):
             DEFAULT_WORKBENCH_TOOL_NAMES,
             (*DEFAULT_FILEGLIDE_TOOL_NAMES, *DEFAULT_BUSINESS_TOOL_NAMES),
         )
-        self.assertIn("美股 IPO 研究", DEFAULT_SYSTEM_PROMPT)
-        self.assertIn("中签率", DEFAULT_SYSTEM_PROMPT)
+        self.assertEqual(DEFAULT_AGENT_BRAND, "OpenBuffett")
+        self.assertIn("OpenBuffett", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("估值主链第一", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("先搜索或调用市场数据源推断候选 ticker", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("未确认前，禁止进入正式估值结论", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("未上市且正在申购/即将申购", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("1 年、5 年、10 年、15 年", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn(DEFAULT_REPORT_FOLLOW_UP, DEFAULT_SYSTEM_PROMPT)
         self.assertNotIn("text.read", DEFAULT_SYSTEM_PROMPT)
 
     def test_build_default_tools_returns_public_tool_objects(self) -> None:
@@ -220,6 +229,14 @@ class EasyHarnessToolingTests(unittest.TestCase):
         self.assertIn("计算或化简", str(specs["calculator"]["description"]))
         self.assertIn("当前本地日期时间", str(specs["now"]["description"]))
         self.assertIn("抓取单个网页", str(specs["web_fetch_page"]["description"]))
+
+    def test_opening_message_reflects_new_capability_priority(self) -> None:
+        """默认开场文案应先讲估值，再讲打新与市场数据辅助。"""
+
+        self.assertIn("专业级估值分析", DEFAULT_OPENING_MESSAGE)
+        self.assertIn("打新分析", DEFAULT_OPENING_MESSAGE)
+        self.assertIn("市场数据辅助", DEFAULT_OPENING_MESSAGE)
+        self.assertIn("先帮你推断候选股票代码", DEFAULT_OPENING_MESSAGE)
 
     def test_build_default_agent_returns_easyharness_agent(self) -> None:
         """默认 agent 装配入口应直接返回 EasyHarness Agent。"""
