@@ -104,9 +104,10 @@ uv run -m src.tui
 
 ## 示例研报
 
-如果你想先看看 agent 的实际研究输出长什么样，可以直接阅读下面这份示例估值研报：
+如果你想先看看 agent 的实际研究输出长什么样，可以直接阅读下面这些示例估值研报：
 
 - [NVIDIA 估值研究报告示例](../docs/NVDA_Valuation_Report_20260704.md)
+- [AAOI 估值研究报告示例](../docs/AAOI_valuation_20260705.md)
 
 ## 学术引用
 

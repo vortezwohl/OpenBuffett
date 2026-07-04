@@ -106,8 +106,9 @@ Before the first real run, configure the environment variables required by the d
 
 Want to see what the agent's research output looks like?
 
-Read the sample valuation report here:
+Read the sample valuation reports here:
 - [NVIDIA Valuation Report Example](./docs/NVDA_Valuation_Report_20260704.md)
+- [AAOI Valuation Report Example](./docs/AAOI_valuation_20260705.md)
 
 ## Citation
 
