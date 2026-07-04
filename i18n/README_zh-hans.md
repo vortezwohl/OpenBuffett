@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>OpenBuffett</h1>
+  <img src="../assets/openbuffett-wordmark.svg" alt="OpenBuffett" width="560" />
   <p>
     <strong>
       一个以巴菲特式方法研究公司的自主智能体。<br>提供专业级公司研究、可比分析与严谨的价格发现能力。

@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>OpenBuffett</h1>
+  <img src="./assets/openbuffett-wordmark.svg" alt="OpenBuffett" width="560" />
   <p>
     <strong>
       An autonomous agent that study companies the way Buffett does.<br>For professional-grade company study, comparables analysis, and disciplined price discovery.

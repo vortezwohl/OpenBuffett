@@ -1,0 +1,89 @@
+<svg width="760" height="220" viewBox="0 0 760 220" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">OpenBuffett</title>
+  <desc id="desc">OpenBuffett irregular acid-bubble wordmark in the project's mint-green theme.</desc>
+  <defs>
+    <linearGradient id="bubbleFill" x1="112" y1="40" x2="606" y2="178" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f6fff7" />
+      <stop offset="0.42" stop-color="#d8ffe0" />
+      <stop offset="1" stop-color="#b8f5c7" />
+    </linearGradient>
+    <linearGradient id="bubbleHighlight" x1="194" y1="60" x2="532" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.96" />
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0" />
+    </linearGradient>
+    <filter id="softShadow" x="28" y="18" width="708" height="176" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feOffset dx="0" dy="10" />
+      <feGaussianBlur stdDeviation="8" />
+      <feColorMatrix type="matrix" values="0 0 0 0 0.0705882 0 0 0 0 0.196078 0 0 0 0 0.145098 0 0 0 0.42 0" />
+    </filter>
+    <filter id="acidWarp" x="44" y="16" width="672" height="188" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.01 0.016" numOctaves="2" seed="11" result="noise" />
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="5" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+  </defs>
+
+  <g filter="url(#softShadow)">
+    <g transform="translate(0 8) rotate(-1 380 110)" fill="#123225" opacity="0.92">
+      <text x="86" y="140" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="88" font-weight="700">O</text>
+      <text x="151" y="146" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="82" font-weight="700">p</text>
+      <text x="210" y="134" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="76" font-weight="700">e</text>
+      <text x="258" y="146" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="78" font-weight="700">n</text>
+      <text x="319" y="133" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="96" font-weight="700">B</text>
+      <text x="392" y="147" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="82" font-weight="700">u</text>
+      <text x="451" y="138" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="90" font-weight="700">f</text>
+      <text x="492" y="149" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="86" font-weight="700">f</text>
+      <text x="529" y="136" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="77" font-weight="700">e</text>
+      <text x="577" y="144" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="83" font-weight="700">t</text>
+      <text x="622" y="150" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="79" font-weight="700">t</text>
+    </g>
+  </g>
+
+  <g transform="rotate(-1 380 110)">
+    <g fill="url(#bubbleFill)" opacity="0.92">
+      <ellipse cx="147" cy="128" rx="19" ry="13" />
+      <ellipse cx="236" cy="128" rx="15" ry="10" />
+      <ellipse cx="370" cy="124" rx="22" ry="14" />
+      <ellipse cx="476" cy="132" rx="17" ry="12" />
+      <ellipse cx="518" cy="134" rx="15" ry="10" />
+      <ellipse cx="615" cy="136" rx="15" ry="10" />
+    </g>
+
+    <g filter="url(#acidWarp)" stroke="#123225" stroke-width="8" stroke-linejoin="round" paint-order="stroke fill">
+      <text x="86" y="136" transform="rotate(-3 116 112) scale(1.01 1.02)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="88" font-weight="700" fill="url(#bubbleFill)">O</text>
+      <text x="151" y="142" transform="rotate(2 174 120) scale(0.995 1.03)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="82" font-weight="700" fill="url(#bubbleFill)">p</text>
+      <text x="210" y="132" transform="rotate(-2 232 108) scale(1.01 0.99)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="76" font-weight="700" fill="url(#bubbleFill)">e</text>
+      <text x="258" y="142" transform="rotate(2 284 121) scale(1.005 1.015)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="78" font-weight="700" fill="url(#bubbleFill)">n</text>
+      <text x="319" y="130" transform="rotate(-1 352 102) scale(1.02 1.015)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="96" font-weight="700" fill="url(#bubbleFill)">B</text>
+      <text x="392" y="143" transform="rotate(1 419 121) scale(1 1.03)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="82" font-weight="700" fill="url(#bubbleFill)">u</text>
+      <text x="451" y="135" transform="rotate(-3 476 110) scale(1.005 1.04)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="90" font-weight="700" fill="url(#bubbleFill)">f</text>
+      <text x="492" y="145" transform="rotate(3 517 124) scale(0.995 1.03)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="86" font-weight="700" fill="url(#bubbleFill)">f</text>
+      <text x="529" y="134" transform="rotate(-1 551 110) scale(1.005 0.99)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="77" font-weight="700" fill="url(#bubbleFill)">e</text>
+      <text x="577" y="141" transform="rotate(1 600 119) scale(1.005 1.03)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="83" font-weight="700" fill="url(#bubbleFill)">t</text>
+      <text x="622" y="146" transform="rotate(3 645 126) scale(0.995 1.005)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="79" font-weight="700" fill="url(#bubbleFill)">t</text>
+    </g>
+
+    <g filter="url(#acidWarp)" fill="url(#bubbleHighlight)" opacity="0.78">
+      <text x="95" y="106" transform="rotate(-3 120 86) scale(0.995 0.88)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="74" font-weight="700">O</text>
+      <text x="160" y="111" transform="rotate(2 181 92) scale(0.97 0.87)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="68" font-weight="700">p</text>
+      <text x="219" y="102" transform="rotate(-2 238 82) scale(0.975 0.86)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="62" font-weight="700">e</text>
+      <text x="267" y="111" transform="rotate(2 292 93) scale(0.98 0.87)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="64" font-weight="700">n</text>
+      <text x="330" y="98" transform="rotate(-1 360 80) scale(0.995 0.85)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="78" font-weight="700">B</text>
+      <text x="404" y="111" transform="rotate(1 427 94) scale(0.97 0.86)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="66" font-weight="700">u</text>
+      <text x="462" y="103" transform="rotate(-3 485 84) scale(0.97 0.88)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="73" font-weight="700">f</text>
+      <text x="503" y="112" transform="rotate(3 525 95) scale(0.97 0.87)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="69" font-weight="700">f</text>
+      <text x="540" y="102" transform="rotate(-1 557 83) scale(0.975 0.85)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="61" font-weight="700">e</text>
+      <text x="586" y="111" transform="rotate(1 606 93) scale(0.97 0.87)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="67" font-weight="700">t</text>
+      <text x="631" y="116" transform="rotate(3 649 99) scale(0.965 0.86)" font-family="'Baloo 2', 'Fredoka', 'Arial Rounded MT Bold', 'Trebuchet MS', sans-serif" font-size="63" font-weight="700">t</text>
+    </g>
+  </g>
+
+  <g opacity="0.9">
+    <circle cx="108" cy="60" r="9" fill="#effff1" />
+    <circle cx="138" cy="42" r="5" fill="#d8ffe0" />
+    <circle cx="598" cy="49" r="8" fill="#effff1" />
+    <circle cx="624" cy="64" r="5" fill="#b8f5c7" />
+    <ellipse cx="83" cy="158" rx="16" ry="9" fill="#b8f5c7" opacity="0.72" />
+    <ellipse cx="642" cy="154" rx="14" ry="8" fill="#d8ffe0" opacity="0.68" />
+    <circle cx="680" cy="130" r="7" fill="#effff1" opacity="0.78" />
+  </g>
+</svg>
