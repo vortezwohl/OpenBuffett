@@ -104,6 +104,13 @@ Before the first real run, configure the environment variables required by the d
 - `FMP_API_KEY`: required FMP API key. OpenBuffett's core research flow depends on FMP-backed market and company data, so real runs without this key are not supported.
 - `FMP_API_BASE`: optional FMP base URL override.
 
+## Example Report
+
+Want to see what the agent's research output looks like?
+
+Read the sample valuation report here:
+- [NVIDIA Valuation Report Example](./docs/NVDA_Valuation_Report_20260704.md)
+
 ## Citation
 
 If you use OpenBuffett in academic, research, or industry work, cite the repository as software:

@@ -104,6 +104,12 @@ python -m src.tui
 - `FMP_API_KEY`：必需。OpenBuffett 的核心研究链路依赖 FMP 提供的市场与公司数据，因此没有这个 key 的真实运行场景不受支持。
 - `FMP_API_BASE`：可选，FMP base URL 覆盖项。
 
+## 示例研报
+
+如果你想先看看 agent 的实际研究输出长什么样，可以直接阅读下面这份示例估值研报：
+
+- [NVIDIA 估值研究报告示例](../docs/NVDA_Valuation_Report_20260704.md)
+
 ## 学术引用
 
 如果你在学术研究、行业研究或其他正式工作中使用 OpenBuffett，建议按软件形式引用本仓库：
