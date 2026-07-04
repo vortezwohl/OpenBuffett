@@ -91,10 +91,9 @@ At the repository level, the default product surface is intentionally narrow: Op
 ## Quick Start
 
 ```bash
-git clone https://github.com/vortezwohl/SmartIPO.git
-cd SmartIPO
-uv sync
-python -m src.tui
+git clone https://github.com/vortezwohl/OpenBuffett.git
+cd OpenBuffett
+uv run -m src.tui
 ```
 
 Before the first real run, configure the environment variables required by the default agent runtime:

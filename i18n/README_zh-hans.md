@@ -91,10 +91,9 @@ OpenBuffett 当前主要建立在三层技术栈之上：
 ## 启动方式
 
 ```bash
-git clone https://github.com/vortezwohl/SmartIPO.git
-cd SmartIPO
-uv sync
-python -m src.tui
+git clone https://github.com/vortezwohl/OpenBuffett.git
+cd OpenBuffett
+uv run -m src.tui
 ```
 
 第一次真实运行前，请先配置默认 agent runtime 所需的环境变量：
