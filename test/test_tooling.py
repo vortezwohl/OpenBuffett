@@ -145,7 +145,9 @@ class EasyHarnessToolingTests(unittest.TestCase):
         self.assertIn("先搜索或调用市场数据源推断候选 ticker", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("未确认前，禁止进入正式估值结论", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("未上市且正在申购/即将申购", DEFAULT_SYSTEM_PROMPT)
-        self.assertIn("1 年、5 年、10 年、15 年", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("1个月、6个月、1年、3年、5年", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("货币/经济政策、地缘政治、广泛市场情绪、资金流向", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("利率路径、联储口径、通胀/就业数据", DEFAULT_SYSTEM_PROMPT)
         self.assertIn(DEFAULT_REPORT_FOLLOW_UP, DEFAULT_SYSTEM_PROMPT)
         self.assertNotIn("text.read", DEFAULT_SYSTEM_PROMPT)
 

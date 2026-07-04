@@ -1,7 +1,7 @@
 ## 1. Agent Identity And Prompt Contract
 
 - [x] 1.1 在 `src/agent.py` 中新增并导出 `OpenBuffett` 品牌常量、启动开场常量与研究报告追问相关常量，集中承载新的产品身份定义
-- [x] 1.2 重写默认 system prompt，使其明确估值优先、ticker 先确认、打新门禁、事实分级、多周期估值判断、当前做多/做空风险提示与报告追问合同
+- [x] 1.2 重写默认 system prompt，使其明确估值优先、ticker 先确认、打新门禁、事实分级、多周期估值判断、短期宏观与资金面约束、当前做多/做空风险提示与报告追问合同
 - [x] 1.3 更新 `src/__init__.py`、`src/tool/__init__.py`、`src/tool/basic_tools.py`、`README.md` 与 `pyproject.toml` 的当前对外表面文案和元数据，移除现行运行面中的 `SmartIPO` 品牌露出而不改历史归档文件
 
 ## 2. TUI Opening And Branding Surface
@@ -13,7 +13,7 @@
 ## 3. Research Workflow Guardrails
 
 - [x] 3.1 调整默认研究行为，使非 ticker 输入先进入候选代码推断与用户确认阶段，确认前不得继续正式估值或打新分析
-- [x] 3.2 调整默认估值研究输出，确保完整分析覆盖结论先行、证据等级、可比公司、1/5/10/15 年估值视角与当前时间点风险提示
+- [x] 3.2 调整默认估值研究输出，确保完整分析覆盖结论先行、证据等级、可比公司、1个月/6个月/1年/3年/5年估值视角，以及短期宏观与资金面驱动和当前时间点风险提示
 - [x] 3.3 调整默认打新研究输出，确保其仅在未上市且可申购/待申购场景触发，并在结尾主动询问是否生成当前工作路径下的中文 Markdown 研究报告
 
 ## 4. Regression And Verification

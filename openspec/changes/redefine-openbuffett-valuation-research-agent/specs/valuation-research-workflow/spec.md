@@ -15,11 +15,25 @@ The system MUST ground valuation analysis in business quality, financial quality
 - **THEN** it MUST include evidence-supported discussion of company quality, financial quality, and comparable companies from the same or closely related sector
 
 ### Requirement: Valuation output SHALL include multi-horizon judgment and current-market risk framing
-For a complete valuation answer, the system MUST state whether the target appears cheap or expensive across at least four horizons: 1 year, 5 years, 10 years, and 15 years. The answer MUST also warn about the risk of immediately going long or short under the current market regime and MUST anchor the conclusion to the current analysis date.
+For a complete valuation answer, the system MUST state whether the target appears cheap or expensive across five horizons: 1 month, 6 months, 1 year, 3 years, and 5 years. The answer MUST also warn about the risk of immediately going long or short under the current market regime and MUST anchor the conclusion to the current analysis date.
 
 #### Scenario: User asks whether a stock is cheap or expensive
 - **WHEN** the system provides a full valuation conclusion
-- **THEN** it MUST include 1-year, 5-year, 10-year, and 15-year valuation perspectives and explicit current long/short risk warnings with a date anchor
+- **THEN** it MUST include 1-month, 6-month, 1-year, 3-year, and 5-year valuation perspectives and explicit current long/short risk warnings with a date anchor
+
+### Requirement: Short-horizon valuation framing SHALL include macro, geopolitics, market mood, and fund-flow context
+For the 1-month and 6-month horizons, the system MUST explicitly analyze monetary/economic policy, geopolitical risk, broad market sentiment, and capital or fund-flow conditions. It MUST treat these as first-class inputs rather than optional commentary.
+
+#### Scenario: System produces short-horizon valuation judgment
+- **WHEN** the answer states a 1-month or 6-month valuation view
+- **THEN** it MUST include explicit discussion of monetary/economic policy, geopolitics, broad market sentiment, and fund-flow context
+
+### Requirement: Short-horizon macro commentary SHALL use observable proxies or admit confidence limits
+When the system discusses short-horizon valuation or risk framing, it MUST ground that discussion in observable proxies where possible, such as rate-path expectations, Fed communication, inflation or labor data, yield curves, dollar strength, oil, VIX, credit spreads, ETF or sector flows, relative strength, or crowding. If reliable evidence is missing, the system MUST disclose that the short-horizon judgment has limited confidence instead of presenting a confident unsupported claim.
+
+#### Scenario: Reliable short-horizon market proxies are unavailable
+- **WHEN** the system cannot verify enough macro or flow evidence for a confident 1-month or 6-month judgment
+- **THEN** it MUST explicitly say that short-horizon confidence is limited and avoid overstating certainty
 
 ### Requirement: Unsupported market-data coverage SHALL be disclosed instead of fabricated
 When a user asks for a non-core asset or a data view that is not reliably covered by the currently integrated tools, the system MUST state that the requested analysis cannot be verified with the current data surface. It MUST NOT overstate support or fabricate precise conclusions for unsupported instruments.
