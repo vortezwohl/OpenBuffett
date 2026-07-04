@@ -107,7 +107,7 @@ class _QueuedTurnEvent:
 class _TextRevealChunk:
     """描述等待按节拍逐字符吐出的文本片段。"""
 
-    turn_id: str
+    turn_id: str | None
     item_key: str
     text: str
 
@@ -772,10 +772,37 @@ class AgentWorkbenchApp(App[None]):
 
         if self._items:
             return
-        self._append_assistant_message(
+        self._append_streamed_static_assistant_message(
             DEFAULT_OPENING_MESSAGE,
             metadata={"opening_message": True},
         )
+
+    def _append_streamed_static_assistant_message(
+        self,
+        content: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """追加一条静态 assistant 消息，并复用正常消息的逐字 reveal 管线。"""
+
+        item_key = self._append_item(
+            kind="assistant",
+            title="Assistant > ",
+            body="",
+            status="completed",
+            metadata=metadata,
+        )
+        item = self._get_item(item_key)
+        if item is None:
+            return item_key
+        self._set_text_reveal_target(item, "")
+        self._enqueue_text_reveal_suffix(
+            item,
+            previous_target="",
+            next_target=content,
+            stream_without_turn=True,
+        )
+        return item_key
 
     def _enforce_locked_theme(self) -> None:
         """把应用主题收口到唯一允许的 ansi-dark。"""
@@ -1180,7 +1207,7 @@ class AgentWorkbenchApp(App[None]):
         if not self._pending_text_reveal_queue:
             return False
         chunk = self._pending_text_reveal_queue[0]
-        if not self._is_active_turn(chunk.turn_id):
+        if chunk.turn_id is not None and not self._is_active_turn(chunk.turn_id):
             self._pending_text_reveal_queue.popleft()
             return True
         item = self._get_item(chunk.item_key)
@@ -2000,6 +2027,7 @@ class AgentWorkbenchApp(App[None]):
         *,
         previous_target: str,
         next_target: str,
+        stream_without_turn: bool = False,
     ) -> None:
         """把目标文本中新追加的后缀排入逐字符 reveal 队列。"""
 
@@ -2007,6 +2035,15 @@ class AgentWorkbenchApp(App[None]):
             return
         suffix = next_target[len(previous_target) :]
         if not suffix:
+            return
+        if stream_without_turn:
+            self._pending_text_reveal_queue.append(
+                _TextRevealChunk(
+                    turn_id=None,
+                    item_key=item.key,
+                    text=suffix,
+                )
+            )
             return
         if self._active_turn is None or self._active_worker is None:
             item.body += suffix
